@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import sys
 from typing import Annotated
 
 import typer
@@ -20,10 +21,19 @@ from .session import (
     expand_session_plan,
     run_profile_session,
     summarize_session_budget,
+    TerminalProgressReporter,
 )
 
 app = typer.Typer(help="Profile local Ollama workloads.")
 _SUPPORTED_BENCHMARK_TYPES: tuple[BenchmarkType, ...] = tuple(BenchmarkType)
+
+
+def _build_terminal_echo() -> Callable[[str, bool], None]:
+    def emit(message: str, nl: bool = True) -> None:
+        sys.stdout.write(message + ("\n" if nl else ""))
+        sys.stdout.flush()
+
+    return emit
 
 
 def _parse_multi_select(
@@ -145,6 +155,13 @@ def profile(
         str | None,
         typer.Option("--benchmark-types", help="Comma-separated benchmark ids."),
     ] = None,
+    live_progress: Annotated[
+        bool,
+        typer.Option(
+            "--live-progress",
+            help="Show live benchmark status, telemetry, and per-run summaries.",
+        ),
+    ] = False,
     output_dir: Path = typer.Option(
         Path("results"),
         "--output-dir",
@@ -214,6 +231,10 @@ def profile(
             output_dir=output_dir,
             available_models=available_models,
             expanded_plan=expanded_plan,
+            progress_reporter=TerminalProgressReporter(
+                echo=_build_terminal_echo(),
+                live=live_progress,
+            ),
         )
 
     typer.echo(f"Session artifacts written to: {result.session_dir}")

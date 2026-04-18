@@ -36,6 +36,7 @@ from ollama_workload_profiler.prompts.scenarios import (
     build_scenarios_for_benchmark,
 )
 from ollama_workload_profiler.session import (
+    TerminalProgressReporter,
     _OllamaDispatcher,
     build_profile_session_plan,
     expand_session_plan,
@@ -415,6 +416,274 @@ def test_run_profile_session_persists_phase_peaks_from_real_sampler(
     assert len(raw_rows) == 1
     assert raw_rows[0]["metrics"]["phase_peaks"]["generation"]["rss_mb"] == 192.0
     assert raw_rows[0]["metrics"]["phase_peaks"]["generation"]["cpu_percent"] == 35.0
+
+
+def test_run_profile_session_notifies_progress_reporter_for_each_run(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE, BenchmarkType.TTFT],
+        repetitions=1,
+    )
+    progress_events: list[tuple[str, object]] = []
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    class FakeProgressReporter:
+        def on_run_started(self, planned_run: PlannedRun, *, total_runs: int) -> None:
+            progress_events.append(
+                (
+                    "start",
+                    planned_run.run_index,
+                    total_runs,
+                    planned_run.benchmark_type.value,
+                    planned_run.scenario_name,
+                    planned_run.context_size,
+                    planned_run.repetition_index,
+                )
+            )
+
+        def on_run_finished(self, run_result: RunResult, *, total_runs: int) -> None:
+            progress_events.append(
+                (
+                    "finish",
+                    run_result.run_index,
+                    total_runs,
+                    run_result.state.value,
+                )
+            )
+
+        def on_session_finished(self, summary: ReportSummary, *, total_runs: int) -> None:
+            progress_events.append(
+                (
+                    "session",
+                    total_runs,
+                    summary.session_metrics["completed_runs"],
+                    summary.session_metrics["failed_runs"],
+                )
+            )
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+
+    run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        progress_reporter=FakeProgressReporter(),
+        session_timestamp=datetime(2026, 4, 19, 11, 30, 0, tzinfo=timezone.utc),
+    )
+
+    assert progress_events == [
+        ("start", 1, 3, "smoke", "Smoke sanity check", 4096, 1),
+        ("finish", 1, 3, "completed"),
+        ("start", 2, 3, "ttft", "TTFT probe", 4096, 1),
+        ("finish", 2, 3, "completed"),
+        ("start", 3, 3, "ttft", "TTFT chat probe", 4096, 1),
+        ("finish", 3, 3, "completed"),
+        ("session", 3, 3, 0),
+    ]
+
+
+def test_terminal_progress_reporter_emits_default_and_live_progress_lines() -> None:
+    outputs: list[tuple[str, bool]] = []
+    clock_values = iter([100.0, 101.25])
+    planned_run = PlannedRun(
+        run_id="run-progress",
+        run_index=7,
+        model_name="gemma4:latest",
+        context_size=32768,
+        context_index=1,
+        benchmark_type=BenchmarkType.CONTEXT_SCALING,
+        benchmark_type_index=1,
+        scenario_id="context-scaling-high-v1",
+        scenario_index=3,
+        repetition_index=2,
+        scenario_name="High fill context",
+        scenario_version="v1",
+    )
+    run_result = RunResult(
+        run_id=planned_run.run_id,
+        run_index=planned_run.run_index,
+        model_name=planned_run.model_name,
+        context_size=planned_run.context_size,
+        context_index=planned_run.context_index,
+        benchmark_type=planned_run.benchmark_type,
+        benchmark_type_index=planned_run.benchmark_type_index,
+        scenario_id=planned_run.scenario_id,
+        scenario_index=planned_run.scenario_index,
+        scenario_version=planned_run.scenario_version,
+        repetition_index=planned_run.repetition_index,
+        scenario_name=planned_run.scenario_name,
+        state=RunState.COMPLETED,
+        elapsed_ms=1250.0,
+        metrics={"tokens_per_second": 42.5},
+    )
+
+    reporter = TerminalProgressReporter(
+        echo=lambda message, nl=True: outputs.append((message, nl)),
+        live=True,
+        telemetry_provider=lambda: {"cpu_percent": 73.5, "rss_mb": 2048.0, "tokens_per_second": None},
+        clock=lambda: next(clock_values),
+        poll_interval_seconds=60.0,
+        terminal_width_provider=lambda: 200,
+    )
+
+    reporter.on_run_started(planned_run, total_runs=42)
+    reporter.on_run_finished(run_result, total_runs=42)
+
+    lines = [message for message, _nl in outputs]
+    assert any("Run 7/42" in line for line in lines)
+    assert any("context-scaling" in line for line in lines)
+    assert any("High fill context" in line for line in lines)
+    assert any("ctx 32768" in line for line in lines)
+    assert any("rep 2" in line for line in lines)
+    assert any("elapsed 1s" in line for line in lines)
+    assert any("CPU 73.5%" in line and "RSS 2048.0 MB" in line for line in lines)
+    assert any("completed 0 | pending 42 | failed 0" in line for line in lines)
+    assert any(
+        "Result | run 7/42 | completed | context-scaling | High fill context" in line
+        and "elapsed 1.2s" in line
+        and "tok/s 42.5" in line
+        for line in lines
+    )
+
+
+def test_terminal_progress_reporter_redraws_live_status_in_place() -> None:
+    outputs: list[tuple[str, bool]] = []
+    clock_values = iter([10.0, 10.5])
+    planned_run = PlannedRun(
+        run_id="run-live-redraw",
+        run_index=2,
+        model_name="gemma4:e2b",
+        context_size=65536,
+        context_index=1,
+        benchmark_type=BenchmarkType.PROMPT_SCALING,
+        benchmark_type_index=1,
+        scenario_id="prompt-scaling-large-v1",
+        scenario_index=3,
+        repetition_index=1,
+        scenario_name="Large prompt",
+        scenario_version="v1",
+    )
+    run_result = RunResult(
+        run_id=planned_run.run_id,
+        run_index=planned_run.run_index,
+        model_name=planned_run.model_name,
+        context_size=planned_run.context_size,
+        context_index=planned_run.context_index,
+        benchmark_type=planned_run.benchmark_type,
+        benchmark_type_index=planned_run.benchmark_type_index,
+        scenario_id=planned_run.scenario_id,
+        scenario_index=planned_run.scenario_index,
+        scenario_version=planned_run.scenario_version,
+        repetition_index=planned_run.repetition_index,
+        scenario_name=planned_run.scenario_name,
+        state=RunState.COMPLETED,
+        elapsed_ms=500.0,
+        metrics={},
+    )
+
+    reporter = TerminalProgressReporter(
+        echo=lambda message, nl=True: outputs.append((message, nl)),
+        live=True,
+        telemetry_provider=lambda: {"cpu_percent": 50.0, "rss_mb": 1024.0, "tokens_per_second": None},
+        clock=lambda: next(clock_values),
+        poll_interval_seconds=60.0,
+    )
+
+    reporter.on_run_started(planned_run, total_runs=5)
+    reporter.on_run_finished(run_result, total_runs=5)
+
+    live_updates = [(message, nl) for message, nl in outputs if message.startswith("\rLive ")]
+    result_rows = [(message, nl) for message, nl in outputs if "Result | run 2/5" in message]
+
+    assert live_updates
+    assert all(nl is False for _message, nl in live_updates)
+    assert result_rows
+    assert all(nl is True for _message, nl in result_rows)
+
+
+def test_terminal_progress_reporter_truncates_live_status_to_terminal_width() -> None:
+    outputs: list[tuple[str, bool]] = []
+    clock_values = iter([10.0, 10.5])
+    planned_run = PlannedRun(
+        run_id="run-live-width",
+        run_index=2,
+        model_name="gemma4:e2b",
+        context_size=65536,
+        context_index=1,
+        benchmark_type=BenchmarkType.PROMPT_SCALING,
+        benchmark_type_index=1,
+        scenario_id="prompt-scaling-large-v1",
+        scenario_index=3,
+        repetition_index=1,
+        scenario_name="Large prompt",
+        scenario_version="v1",
+    )
+
+    reporter = TerminalProgressReporter(
+        echo=lambda message, nl=True: outputs.append((message, nl)),
+        live=True,
+        telemetry_provider=lambda: {"cpu_percent": 50.0, "rss_mb": 1024.0, "tokens_per_second": None},
+        clock=lambda: next(clock_values),
+        poll_interval_seconds=60.0,
+        terminal_width_provider=lambda: 40,
+    )
+
+    reporter.on_run_started(planned_run, total_runs=5)
+
+    live_updates = [message for message, nl in outputs if nl is False]
+
+    assert live_updates
+    assert all(message.startswith("\r") for message in live_updates)
+    assert all(len(message.removeprefix("\r")) <= 40 for message in live_updates)
+
+
+def test_terminal_progress_reporter_emits_live_session_summary_from_dict_metrics() -> None:
+    outputs: list[tuple[str, bool]] = []
+    summary = ReportSummary(
+        session_metrics={
+            "completed_runs": 6,
+            "failed_runs": 0,
+        }
+    )
+    reporter = TerminalProgressReporter(
+        echo=lambda message, nl=True: outputs.append((message, nl)),
+        live=True,
+        poll_interval_seconds=60.0,
+    )
+
+    reporter.on_session_finished(summary, total_runs=6)
+
+    assert outputs == [("\rSession summary | completed 6 | failed 0 | total 6", True)]
 
 
 def test_compute_phase_peaks_groups_samples_by_phase() -> None:

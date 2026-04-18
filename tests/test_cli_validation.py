@@ -1,11 +1,17 @@
 import json
 from pathlib import Path
+import sys
 
 import pytest
 from typer import BadParameter
 from typer.testing import CliRunner
 
-from ollama_workload_profiler.cli import app, parse_benchmark_types, parse_contexts
+from ollama_workload_profiler.cli import (
+    _build_terminal_echo,
+    app,
+    parse_benchmark_types,
+    parse_contexts,
+)
 from ollama_workload_profiler.models.plan import BenchmarkType
 
 
@@ -16,6 +22,39 @@ def test_cli_shows_root_help() -> None:
     assert result.exit_code == 0
     assert "doctor" in result.stdout
     assert "profile" in result.stdout
+
+
+def test_profile_help_includes_live_progress_flag() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["profile", "--help"])
+
+    assert result.exit_code == 0
+    assert "--live-progress" in result.stdout
+
+
+def test_build_terminal_echo_writes_directly_to_stdout_and_flushes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[str] = []
+    flush_calls = 0
+
+    class FakeStdout:
+        def write(self, message: str) -> int:
+            writes.append(message)
+            return len(message)
+
+        def flush(self) -> None:
+            nonlocal flush_calls
+            flush_calls += 1
+
+    monkeypatch.setattr(sys, "stdout", FakeStdout())
+
+    echo = _build_terminal_echo()
+    echo("\rLive | example", nl=False)
+    echo("Result | example", nl=True)
+
+    assert writes == ["\rLive | example", "Result | example\n"]
+    assert flush_calls == 2
 
 
 def test_cli_module_entrypoint_runs() -> None:
