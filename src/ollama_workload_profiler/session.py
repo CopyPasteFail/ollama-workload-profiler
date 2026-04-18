@@ -296,17 +296,19 @@ class _OllamaDispatcher:
         started_at: float,
     ) -> tuple[dict[str, Any], dict[str, Any], float]:
         if isinstance(prompt_payload, MultiTurnChatPromptPayload):
-            stream_factory = lambda: self._client.stream_chat(
-                model=request.run.model_name,
-                messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
-                options=self._build_options(request),
-            )
+            def stream_factory() -> Any:
+                return self._client.stream_chat(
+                    model=request.run.model_name,
+                    messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
+                    options=self._build_options(request),
+                )
         else:
-            stream_factory = lambda: self._client.stream_generate(
-                model=request.run.model_name,
-                prompt=prompt_payload.text,
-                options=self._build_options(request),
-            )
+            def stream_factory() -> Any:
+                return self._client.stream_generate(
+                    model=request.run.model_name,
+                    prompt=prompt_payload.text,
+                    options=self._build_options(request),
+                )
 
         first_token_at: float | None = None
         last_chunk: dict[str, Any] = {}

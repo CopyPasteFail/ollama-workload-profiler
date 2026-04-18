@@ -79,7 +79,6 @@ class BenchmarkRunner:
         sampler = self._sampler_factory()
         self._emit_state(planned_run, RunState.STARTING)
 
-        samples: Sequence[SamplePoint | Mapping[str, Any]] = []
         sampler_started = False
 
         try:
