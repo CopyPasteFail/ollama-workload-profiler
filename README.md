@@ -5,17 +5,37 @@
 ## Install
 
 The repo ships with pinned dependencies in both `requirements.txt` and `pyproject.toml`.
-The bootstrap script creates or reuses `.venv`, installs dependencies, and prints a plain status line for each step.
+The bootstrap script creates or reuses `.venv`, installs dependencies, installs the project itself into that venv with an editable install, and prints a plain status line for each step.
 
 ```powershell
 python scripts/bootstrap.py
 ```
 
+Because the project is installed in editable mode, local changes under `src/` are reflected immediately without setting a custom `PYTHONPATH`.
+
 ## Usage
+
+Bootstrap first, then either activate the environment or call its interpreter directly:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m ollama_workload_profiler --help
+python -m ollama_workload_profiler doctor
+owp doctor
+```
+
+You can also skip activation and call the venv interpreter directly:
+
+```powershell
+.\.venv\Scripts\python.exe -m ollama_workload_profiler doctor
+.\.venv\Scripts\owp.exe doctor
+```
 
 Run help first if you are new to the CLI:
 
 ```powershell
+python -m ollama_workload_profiler --help
+python -m ollama_workload_profiler doctor
 owp --help
 owp doctor
 owp profile --model llama3.2 --contexts 4096,8192 --benchmark-types smoke,use-case-profiles

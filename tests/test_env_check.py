@@ -136,11 +136,21 @@ def test_bootstrap_reuses_existing_venv(tmp_path, monkeypatch) -> None:
 
 def test_bootstrap_main_reports_explicit_rerun_status(monkeypatch, capsys) -> None:
     bootstrap = _load_bootstrap_module()
+
+    class FakeEnvCheck:
+        @staticmethod
+        def detect_ollama_binary() -> bool:
+            return True
+
+        @staticmethod
+        def probe_ollama_server() -> tuple[bool, list[str]]:
+            return True, ["llama3.2"]
+
     monkeypatch.setattr(bootstrap, "ensure_virtualenv", lambda _path: False)
     monkeypatch.setattr(bootstrap, "find_venv_python", lambda _path: _path / "Scripts" / "python.exe")
     monkeypatch.setattr(bootstrap, "install_requirements", lambda _python, _requirements: False)
-    monkeypatch.setattr(bootstrap, "detect_ollama_binary", lambda: True)
-    monkeypatch.setattr(bootstrap, "probe_ollama_server", lambda: (True, ["llama3.2"]))
+    monkeypatch.setattr(bootstrap, "install_editable_project", lambda _python: False)
+    monkeypatch.setattr(bootstrap, "load_env_check_module", lambda: FakeEnvCheck)
 
     exit_code = bootstrap.main()
     captured = capsys.readouterr()
@@ -148,6 +158,7 @@ def test_bootstrap_main_reports_explicit_rerun_status(monkeypatch, capsys) -> No
     assert exit_code == 0
     assert "venv reused" in captured.out
     assert "deps already satisfied" in captured.out
+    assert "package already installed in editable mode" in captured.out
     assert "ollama binary: found" in captured.out
     assert "ollama server: reachable" in captured.out
     assert "models: llama3.2" in captured.out
@@ -180,6 +191,7 @@ def test_summarize_bootstrap_status_distinguishes_rerun_states() -> None:
     status = bootstrap.summarize_bootstrap_status(
         venv_created=False,
         deps_installed=False,
+        package_installed=False,
         ollama_binary_found=False,
         ollama_reachable=False,
         models=[],
@@ -189,6 +201,7 @@ def test_summarize_bootstrap_status_distinguishes_rerun_states() -> None:
         messages=[
             "venv reused",
             "deps already satisfied",
+            "package already installed in editable mode",
             "ollama binary: missing",
             "ollama server: unreachable",
             "models: none found",
