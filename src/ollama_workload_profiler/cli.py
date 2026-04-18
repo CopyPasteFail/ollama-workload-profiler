@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import Annotated
+
+import typer
+
+from .env_check import (
+    detect_dependency_status,
+    detect_ollama_binary,
+    detect_python_environment,
+    probe_ollama_server,
+    summarize_doctor_status,
+)
+from .models.plan import BenchmarkType
+from .ollama_client import OllamaClient
+from .session import (
+    build_profile_session_plan,
+    expand_session_plan,
+    run_profile_session,
+    summarize_session_budget,
+)
+
+app = typer.Typer(help="Profile local Ollama workloads.")
+_SUPPORTED_BENCHMARK_TYPES: tuple[BenchmarkType, ...] = tuple(BenchmarkType)
+
+
+def _parse_multi_select(
+    raw_value: str,
+    *,
+    item_parser: Callable[[str], object],
+    empty_message: str,
+    invalid_message: Callable[[str], str],
+    empty_token_message: str | None = None,
+) -> list[object]:
+    items = [segment.strip() for segment in raw_value.split(",")]
+    if not any(items):
+        raise typer.BadParameter(empty_message)
+
+    parsed_items: list[object] = []
+    seen: set[object] = set()
+
+    for item in items:
+        if not item:
+            if empty_token_message is not None:
+                raise typer.BadParameter(empty_token_message)
+            raise typer.BadParameter(invalid_message(""))
+
+        parsed_item = item_parser(item)
+        if parsed_item in seen:
+            continue
+
+        seen.add(parsed_item)
+        parsed_items.append(parsed_item)
+
+    if not parsed_items:
+        raise typer.BadParameter(empty_message)
+
+    return parsed_items
+
+
+def parse_contexts(raw_value: str) -> list[int]:
+    """Parse a comma-separated context selection."""
+
+    def parse_context(item: str) -> int:
+        try:
+            value = int(item)
+        except ValueError as exc:
+            raise typer.BadParameter("Contexts must be comma-separated integers.") from exc
+        if value <= 0:
+            raise typer.BadParameter("Contexts must be positive integers.")
+        return value
+
+    return _parse_multi_select(
+        raw_value,
+        item_parser=parse_context,
+        empty_message="Select at least one context.",
+        invalid_message=lambda _item: "Contexts must be comma-separated integers.",
+    )
+
+
+def parse_benchmark_types(raw_value: str) -> list[BenchmarkType]:
+    """Parse a comma-separated benchmark type selection."""
+
+    all_types = {benchmark_type.value: benchmark_type for benchmark_type in BenchmarkType}
+    supported_types = {benchmark_type.value: benchmark_type for benchmark_type in _SUPPORTED_BENCHMARK_TYPES}
+
+    def parse_benchmark_type(item: str) -> BenchmarkType:
+        try:
+            benchmark_type = all_types[item]
+        except KeyError as exc:
+            raise typer.BadParameter(f"Invalid benchmark type: {item}.") from exc
+
+        if item not in supported_types:
+            raise typer.BadParameter(f"Unsupported benchmark type: {item}.")
+
+        return benchmark_type
+
+    return _parse_multi_select(
+        raw_value,
+        item_parser=parse_benchmark_type,
+        empty_message="Select at least one benchmark type.",
+        invalid_message=lambda item: f"Invalid benchmark type: {item}.",
+        empty_token_message="Benchmark types must not contain empty values.",
+    )
+
+
+@app.command()
+def doctor() -> None:
+    """Check local environment readiness."""
+    python_status = detect_python_environment()
+    dependencies_ok, missing_dependencies = detect_dependency_status()
+    binary_found = detect_ollama_binary()
+    reachable, models = probe_ollama_server() if binary_found else (False, [])
+    summary = summarize_doctor_status(
+        binary_found=binary_found,
+        reachable=reachable,
+        models=models,
+        dependencies_ok=dependencies_ok,
+        missing_dependencies=missing_dependencies,
+    )
+
+    typer.echo(f"Platform: {summary.platform_name}")
+    typer.echo(f"Python: {python_status.python_version}")
+    typer.echo(f"Venv: {'yes' if python_status.in_venv else 'no'}")
+    typer.echo(f"Executable: {python_status.executable}")
+
+    for message in summary.messages:
+        typer.echo(message)
+
+    if summary.remediation_hints:
+        typer.echo("Remediation hints:")
+        for hint in summary.remediation_hints:
+            typer.echo(f"- {hint}")
+
+    raise typer.Exit(code=summary.exit_code)
+
+
+@app.command()
+def profile(
+    model: Annotated[str | None, typer.Option("--model", help="Model to profile.")] = None,
+    contexts: Annotated[str | None, typer.Option("--contexts", help="Comma-separated context sizes.")] = None,
+    benchmark_types: Annotated[
+        str | None,
+        typer.Option("--benchmark-types", help="Comma-separated benchmark ids."),
+    ] = None,
+    output_dir: Path = typer.Option(
+        Path("results"),
+        "--output-dir",
+        help="Base directory for timestamped session artifacts.",
+    ),
+) -> None:
+    """Run an Ollama workload profile."""
+    with OllamaClient() as client:
+        available_models = client.list_models()
+        if not available_models:
+            typer.echo(
+                "No local Ollama models are available. "
+                "Pull one with `ollama pull <model>` and try again."
+            )
+            raise typer.Exit(code=1)
+
+        selected_model = model or typer.prompt(
+            "Model to profile",
+            default=available_models[0],
+            show_default=True,
+        )
+        if selected_model not in available_models:
+            typer.echo(
+                f"Selected model {selected_model!r} is not available locally. "
+                f"Available models: {', '.join(available_models)}"
+            )
+            raise typer.Exit(code=1)
+
+        raw_contexts = contexts or typer.prompt("Contexts", default="4096", show_default=True)
+        raw_benchmark_types = benchmark_types or typer.prompt(
+            "Benchmark types",
+            default="smoke",
+            show_default=True,
+        )
+        parsed_contexts = parse_contexts(raw_contexts)
+        parsed_benchmark_types = parse_benchmark_types(raw_benchmark_types)
+        plan = build_profile_session_plan(
+            model_name=selected_model,
+            contexts=parsed_contexts,
+            benchmark_types=parsed_benchmark_types,
+        )
+        expanded_plan = expand_session_plan(plan)
+        budget = summarize_session_budget(plan, expanded_plan=expanded_plan)
+
+        typer.echo(f"Model: {selected_model}")
+        typer.echo(f"Contexts: {', '.join(str(context) for context in parsed_contexts)}")
+        typer.echo(
+            "Benchmark types: "
+            + ", ".join(benchmark_type.value for benchmark_type in parsed_benchmark_types)
+        )
+        typer.echo(
+            "Benchmark budget: "
+            f"{budget['run_count']} run(s) across {budget['scenario_count']} scenario(s) "
+            f"from {budget['context_count']} context selection(s) and "
+            f"{budget['benchmark_type_count']} benchmark selection(s) "
+            f"with repetitions={budget['repetitions']}."
+        )
+        if budget["warning"] is not None:
+            typer.echo(f"Budget warning: {budget['warning']}")
+        if not typer.confirm("Proceed with this benchmark session?", default=True):
+            typer.echo("Profile session cancelled.")
+            raise typer.Exit(code=1)
+
+        result = run_profile_session(
+            plan=plan,
+            client=client,
+            output_dir=output_dir,
+            available_models=available_models,
+            expanded_plan=expanded_plan,
+        )
+
+    typer.echo(f"Session artifacts written to: {result.session_dir}")
+
+
+def main() -> None:
+    app()
