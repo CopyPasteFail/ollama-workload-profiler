@@ -273,6 +273,88 @@ def test_run_profile_session_uses_supplied_expanded_plan_order_and_appends_raw_r
     assert environment_payload["session_started_at"] == "2026-04-19T10:00:00+00:00"
 
 
+def test_run_profile_session_records_host_metadata_and_per_run_system_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        repetitions=1,
+    )
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session._build_host_metadata",
+        lambda: {
+            "hostname": "bench-host",
+            "os": {"platform": "test-os", "release": "1.0"},
+            "cpu": {"logical_cores": 16, "physical_cores": 8},
+            "memory": {"total_mb": 32768.0},
+        },
+    )
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session._build_run_system_snapshot",
+        lambda: {
+            "cpu_percent": 21.5,
+            "memory_available_mb": 24000.0,
+            "memory_used_percent": 26.8,
+            "ollama_process_count": 2,
+        },
+    )
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 30, 0, tzinfo=timezone.utc),
+    )
+
+    environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
+    assert environment_payload["host"]["hostname"] == "bench-host"
+    assert environment_payload["host"]["cpu"]["logical_cores"] == 16
+    assert environment_payload["host"]["memory"]["total_mb"] == 32768.0
+
+    raw_rows = [
+        json.loads(line)
+        for line in (result.session_dir / "raw.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert raw_rows[0]["system_snapshot"] == {
+        "cpu_percent": 21.5,
+        "memory_available_mb": 24000.0,
+        "memory_used_percent": 26.8,
+        "ollama_process_count": 2,
+    }
+
+
 def test_run_profile_session_persists_phase_peaks_from_real_sampler(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

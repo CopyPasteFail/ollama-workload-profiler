@@ -36,4 +36,5 @@ class RunResult(BaseModel):
     elapsed_ms: float | None = None
     partial_result: bool = False
     failure: FailureInfo | None = None
+    system_snapshot: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)

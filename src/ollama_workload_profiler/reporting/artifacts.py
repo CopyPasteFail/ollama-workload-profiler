@@ -112,7 +112,7 @@ def _create_session_dir(base_dir: Path, *, session_timestamp: datetime | None) -
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     timestamp = timestamp.astimezone(timezone.utc)
-    session_name = f"session-{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
+    session_name = f"session-{timestamp.strftime('%Y-%m-%d_T%H-%M-%SZ')}"
 
     candidate = base_dir / session_name
     suffix = 1

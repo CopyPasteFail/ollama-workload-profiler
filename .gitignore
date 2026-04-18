@@ -13,6 +13,7 @@ ENV/
 # Distribution / packaging
 build/
 dist/
+results/
 *.egg-info/
 .eggs/
 

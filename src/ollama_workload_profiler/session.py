@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import platform
+import socket
 from contextlib import nullcontext
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
@@ -8,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Any
+
+import psutil
 
 from .benchmarks import build_scenarios_for_benchmark
 from .benchmarks.base import BenchmarkRunner, ExecutionMode, ExecutionRequest, ExecutionResult
@@ -247,7 +251,9 @@ def run_profile_session(
 
     runs: list[RunResult] = []
     for planned_run in planned_runs:
+        run_system_snapshot = _build_run_system_snapshot()
         run_result = runner.run(planned_run)
+        run_result = run_result.model_copy(update={"system_snapshot": run_system_snapshot})
         runs.append(run_result)
         append_run_artifact(session_dir, run=run_result)
 
@@ -282,6 +288,7 @@ def _build_environment_snapshot(
         "in_venv": python_status.in_venv,
         "executable": python_status.executable,
         "ollama_binary_found": detect_ollama_binary(),
+        "host": _build_host_metadata(),
         "selected_model": plan.model_name,
         "available_models": available_models,
         "contexts": plan.contexts,
@@ -391,3 +398,77 @@ def _build_scenarios_for_benchmark(
     benchmark_type: BenchmarkType, context_size: int
 ) -> list[ScenarioDefinition]:
     return build_scenarios_for_benchmark(benchmark_type, context_size)
+
+
+def _build_host_metadata() -> dict[str, Any]:
+    virtual_memory = _safe_virtual_memory()
+    return {
+        "hostname": _safe_string(socket.gethostname),
+        "os": {
+            "platform": _safe_string(platform.system),
+            "release": _safe_string(platform.release),
+            "version": _safe_string(platform.version),
+            "machine": _safe_string(platform.machine),
+        },
+        "cpu": {
+            "processor": _safe_string(platform.processor),
+            "logical_cores": _safe_cpu_count(logical=True),
+            "physical_cores": _safe_cpu_count(logical=False),
+        },
+        "memory": {
+            "total_mb": _bytes_to_mb(getattr(virtual_memory, "total", None)),
+        },
+    }
+
+
+def _build_run_system_snapshot() -> dict[str, Any]:
+    virtual_memory = _safe_virtual_memory()
+    return {
+        "cpu_percent": _safe_cpu_percent(),
+        "memory_available_mb": _bytes_to_mb(getattr(virtual_memory, "available", None)),
+        "memory_used_percent": _safe_number(getattr(virtual_memory, "percent", None)),
+        "ollama_process_count": len(find_ollama_processes()),
+    }
+
+
+def _safe_virtual_memory() -> Any | None:
+    try:
+        return psutil.virtual_memory()
+    except Exception:
+        return None
+
+
+def _safe_cpu_count(*, logical: bool) -> int | None:
+    try:
+        return psutil.cpu_count(logical=logical)
+    except Exception:
+        return None
+
+
+def _safe_cpu_percent() -> float | None:
+    try:
+        return round(float(psutil.cpu_percent(interval=None)), 3)
+    except Exception:
+        return None
+
+
+def _bytes_to_mb(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return round(float(value) / (1024 * 1024), 3)
+
+
+def _safe_number(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return round(float(value), 3)
+
+
+def _safe_string(factory: Any) -> str | None:
+    try:
+        value = factory()
+    except Exception:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value or None

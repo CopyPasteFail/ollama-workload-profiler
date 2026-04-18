@@ -32,7 +32,7 @@ def test_write_session_artifacts_creates_fixed_filenames(tmp_path: Path) -> None
         report_markdown=report_markdown,
     )
 
-    assert output_dir.name == "session-20260418T120000Z"
+    assert output_dir.name == "session-2026-04-18_T12-00-00Z"
     assert (output_dir / "plan.json").exists()
     assert (output_dir / "expanded_plan.json").exists()
     assert (output_dir / "environment.json").exists()
@@ -56,6 +56,11 @@ def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(t
             scenario_index=1,
             state=RunState.COMPLETED,
             elapsed_ms=12.5,
+            system_snapshot={
+                "cpu_percent": 21.5,
+                "memory_available_mb": 24000.0,
+                "ollama_process_count": 2,
+            },
             metrics={
                 "tokens_per_second": 45.0,
                 "phase_peaks": {"generation": {"rss_mb": 256.0, "cpu_percent": 65.0}},
@@ -89,6 +94,8 @@ def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(t
     assert csv_rows[0]["run_id"] == raw_payload["run_id"]
     assert csv_rows[0]["metrics.tokens_per_second"] == "45.0"
     assert csv_rows[0]["metrics.phase_peaks.generation.rss_mb"] == "256.0"
+    assert csv_rows[0]["system_snapshot.cpu_percent"] == "21.5"
+    assert csv_rows[0]["system_snapshot.memory_available_mb"] == "24000.0"
 
 
 def test_write_session_artifacts_creates_unique_session_directories_without_overwriting(tmp_path: Path) -> None:
@@ -115,8 +122,8 @@ def test_write_session_artifacts_creates_unique_session_directories_without_over
         report_markdown=render_markdown_report(summary),
     )
 
-    assert first_output_dir.name == "session-20260418T120000Z"
-    assert second_output_dir.name == "session-20260418T120000Z-01"
+    assert first_output_dir.name == "session-2026-04-18_T12-00-00Z"
+    assert second_output_dir.name == "session-2026-04-18_T12-00-00Z-01"
     assert first_output_dir != second_output_dir
 
 
