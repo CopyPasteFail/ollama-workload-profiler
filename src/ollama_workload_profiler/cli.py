@@ -36,6 +36,45 @@ def _build_terminal_echo() -> Callable[[str, bool], None]:
     return emit
 
 
+def _build_execution_settings(
+    *,
+    seed: int,
+    temperature: float,
+    top_p: float | None,
+    repetitions: int,
+    warmup_runs: int,
+    warmup_enabled: bool,
+) -> dict[str, object]:
+    return {
+        "seed": seed,
+        "temperature": temperature,
+        "top_p": top_p,
+        "repetitions": repetitions,
+        "warmup_runs": warmup_runs,
+        "warmup_enabled": warmup_enabled,
+    }
+
+
+def _format_policy_value(value: object) -> str:
+    if value is None:
+        return "unset"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _format_benchmark_policy(execution_settings: dict[str, object]) -> str:
+    return (
+        "Benchmark policy: "
+        f"seed={_format_policy_value(execution_settings.get('seed'))}, "
+        f"temperature={_format_policy_value(execution_settings.get('temperature'))}, "
+        f"top_p={_format_policy_value(execution_settings.get('top_p'))}, "
+        f"repetitions={_format_policy_value(execution_settings.get('repetitions'))}, "
+        f"warmup_runs={_format_policy_value(execution_settings.get('warmup_runs'))}, "
+        f"warmup_enabled={_format_policy_value(execution_settings.get('warmup_enabled'))}"
+    )
+
+
 def _parse_multi_select(
     raw_value: str,
     *,
@@ -155,6 +194,37 @@ def profile(
         str | None,
         typer.Option("--benchmark-types", help="Comma-separated benchmark ids."),
     ] = None,
+    seed: Annotated[int, typer.Option("--seed", help="Seed for benchmark requests.")] = 42,
+    temperature: Annotated[
+        float,
+        typer.Option(
+            "--temperature",
+            min=0.0,
+            max=2.0,
+            help="Sampling temperature for benchmark requests.",
+        ),
+    ] = 0.0,
+    top_p: Annotated[
+        float | None,
+        typer.Option(
+            "--top-p",
+            min=0.0,
+            max=1.0,
+            help="Top-p sampling value for benchmark requests.",
+        ),
+    ] = None,
+    repetitions: Annotated[
+        int,
+        typer.Option("--repetitions", min=1, help="Number of repeated runs per scenario."),
+    ] = 1,
+    warmup_runs: Annotated[
+        int,
+        typer.Option("--warmup-runs", min=1, help="Silent warmup runs per context size."),
+    ] = 1,
+    no_warmup: Annotated[
+        bool,
+        typer.Option("--no-warmup", help="Disable silent warmup runs."),
+    ] = False,
     live_progress: Annotated[
         bool,
         typer.Option(
@@ -167,8 +237,17 @@ def profile(
         "--output-dir",
         help="Base directory for timestamped session artifacts.",
     ),
-) -> None:
+    ) -> None:
     """Run an Ollama workload profile."""
+    execution_settings = _build_execution_settings(
+        seed=seed,
+        temperature=temperature,
+        top_p=top_p,
+        repetitions=repetitions,
+        warmup_runs=warmup_runs,
+        warmup_enabled=not no_warmup,
+    )
+
     with OllamaClient() as client:
         available_models = client.list_models()
         if not available_models:
@@ -202,6 +281,7 @@ def profile(
             model_name=selected_model,
             contexts=parsed_contexts,
             benchmark_types=parsed_benchmark_types,
+            execution_settings=execution_settings,
         )
         expanded_plan = expand_session_plan(plan)
         budget = summarize_session_budget(plan, expanded_plan=expanded_plan)
@@ -212,6 +292,7 @@ def profile(
             "Benchmark types: "
             + ", ".join(benchmark_type.value for benchmark_type in parsed_benchmark_types)
         )
+        typer.echo(_format_benchmark_policy(execution_settings))
         typer.echo(
             "Benchmark budget: "
             f"{budget['run_count']} run(s) across {budget['scenario_count']} scenario(s) "
