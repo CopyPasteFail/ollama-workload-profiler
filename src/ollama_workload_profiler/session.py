@@ -283,6 +283,13 @@ class _OllamaDispatcher:
             "num_ctx": request.run.context_size,
             "num_predict": request.scenario.target_output_tokens,
         }
+        options["seed"] = request.execution_settings["seed"]
+        options["temperature"] = request.execution_settings["temperature"]
+
+        top_p = request.execution_settings.get("top_p")
+        if top_p is not None:
+            options["top_p"] = top_p
+
         if request.execution_mode is ExecutionMode.TTFT:
             # Some Ollama models collapse `num_predict=1` into a terminal metadata
             # chunk with no observable streamed token, so TTFT uses a small floor.
@@ -338,11 +345,18 @@ def build_profile_session_plan(
     model_name: str,
     contexts: list[int],
     benchmark_types: list[BenchmarkType],
+    seed: int = 42,
+    temperature: float = 0.0,
+    top_p: float | None = None,
     repetitions: int = 1,
     execution_settings: dict[str, Any] | None = None,
 ) -> BenchmarkSessionPlan:
-    settings = dict(execution_settings) if execution_settings is not None else {"repetitions": repetitions}
+    settings = dict(execution_settings) if execution_settings is not None else {}
+    settings.setdefault("seed", seed)
+    settings.setdefault("temperature", temperature)
     settings.setdefault("repetitions", repetitions)
+    if top_p is not None:
+        settings.setdefault("top_p", top_p)
     return BenchmarkSessionPlan(
         model_name=model_name,
         contexts=contexts,
@@ -390,6 +404,7 @@ def run_profile_session(
     runner = BenchmarkRunner(
         dispatcher=_OllamaDispatcher(client),
         sampler_factory=lambda: PollingProcessSampler(process_finder=find_ollama_processes),
+        execution_settings=plan.execution_settings,
     )
 
     environment = _build_environment_snapshot(

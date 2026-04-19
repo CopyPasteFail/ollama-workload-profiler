@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..execution_settings import normalize_execution_settings
+
 
 class BenchmarkType(StrEnum):
     SMOKE = "smoke"
@@ -26,7 +28,7 @@ class BenchmarkSessionPlan(BaseModel):
     stop_conditions: list[dict[str, Any]] = Field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
-    execution_settings: dict[str, Any] = Field(default_factory=dict)
+    execution_settings: dict[str, Any] = Field(default_factory=dict, validate_default=True)
 
     @field_validator("model_name", mode="before")
     @classmethod
@@ -46,13 +48,7 @@ class BenchmarkSessionPlan(BaseModel):
         if not isinstance(value, dict):
             return value
 
-        repetitions = value.get("repetitions")
-        if repetitions is None:
-            return value
-        if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 1:
-            raise ValueError("execution_settings.repetitions must be a positive integer")
-
-        return value
+        return normalize_execution_settings(value)
 
 
 class PlannedRun(BaseModel):

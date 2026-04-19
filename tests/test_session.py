@@ -1229,12 +1229,584 @@ def test_ollama_dispatcher_uses_stream_generate_for_ttft_and_measures_first_toke
             run=planned_run,
             scenario=scenario,
             execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
         )
     )
 
     assert result.metrics["ttft_ms"] == 50.0
     assert result.metrics["ttft_first_token_received"] is True
     assert result.metrics["tokens_per_second"] == 16000.0
+
+
+def test_benchmark_runner_threads_execution_settings_into_dispatcher_request() -> None:
+    planned_run = PlannedRun(
+        run_id="run-request-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    execution_settings = {"seed": 1234, "temperature": 0.2, "top_p": 0.9}
+    seen_requests: list[ExecutionRequest] = []
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return []
+
+    class FakeDispatcher:
+        def execute(self, request: ExecutionRequest) -> ExecutionResult:
+            seen_requests.append(request)
+            return ExecutionResult(elapsed_ms=12.0, metrics={})
+
+    runner = BenchmarkRunner(
+        dispatcher=FakeDispatcher(),
+        sampler_factory=FakeSampler,
+        execution_settings=execution_settings,
+    )
+
+    runner.run(planned_run)
+
+    assert len(seen_requests) == 1
+    assert seen_requests[0].execution_settings == {
+        "seed": 1234,
+        "temperature": 0.2,
+        "repetitions": 1,
+        "top_p": 0.9,
+    }
+
+
+def test_benchmark_runner_defaults_missing_execution_settings_for_dispatcher() -> None:
+    planned_run = PlannedRun(
+        run_id="run-default-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    seen_requests: list[ExecutionRequest] = []
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return []
+
+    class FakeDispatcher:
+        def execute(self, request: ExecutionRequest) -> ExecutionResult:
+            seen_requests.append(request)
+            return ExecutionResult(elapsed_ms=12.0, metrics={})
+
+    runner = BenchmarkRunner(
+        dispatcher=FakeDispatcher(),
+        sampler_factory=FakeSampler,
+    )
+
+    runner.run(planned_run)
+
+    assert seen_requests[0].execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+    }
+
+
+def test_direct_execution_request_defaults_missing_execution_settings() -> None:
+    planned_run = PlannedRun(
+        run_id="run-direct-request-defaults",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, 4096)[0]
+
+    request = ExecutionRequest(
+        run=planned_run,
+        scenario=scenario,
+        execution_mode=ExecutionMode.GENERATE,
+    )
+
+    assert request.execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+    }
+
+
+def test_direct_execution_request_merges_sparse_execution_settings() -> None:
+    planned_run = PlannedRun(
+        run_id="run-direct-request-sparse",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, 4096)[0]
+
+    request = ExecutionRequest(
+        run=planned_run,
+        scenario=scenario,
+        execution_mode=ExecutionMode.GENERATE,
+        execution_settings={"top_p": 0.9},
+    )
+
+    assert request.execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+        "top_p": 0.9,
+    }
+
+
+def test_benchmark_runner_merges_sparse_execution_settings_over_defaults() -> None:
+    planned_run = PlannedRun(
+        run_id="run-sparse-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    seen_requests: list[ExecutionRequest] = []
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return []
+
+    class FakeDispatcher:
+        def execute(self, request: ExecutionRequest) -> ExecutionResult:
+            seen_requests.append(request)
+            return ExecutionResult(elapsed_ms=12.0, metrics={})
+
+    runner = BenchmarkRunner(
+        dispatcher=FakeDispatcher(),
+        sampler_factory=FakeSampler,
+        execution_settings={"top_p": 0.9},
+    )
+
+    runner.run(planned_run)
+
+    assert seen_requests[0].execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+        "top_p": 0.9,
+    }
+
+
+def test_benchmark_runner_rejects_malformed_execution_settings_before_dispatch() -> None:
+    planned_run = PlannedRun(
+        run_id="run-bad-runner-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return []
+
+    class FakeDispatcher:
+        def execute(self, request: ExecutionRequest) -> ExecutionResult:
+            raise AssertionError("dispatcher should not be called")
+
+    with pytest.raises(ValueError, match="execution_settings.top_p"):
+        BenchmarkRunner(
+            dispatcher=FakeDispatcher(),
+            sampler_factory=FakeSampler,
+            execution_settings={"top_p": "bad"},
+        )
+
+
+def test_ollama_dispatcher_builds_generation_options_from_execution_settings() -> None:
+    planned_run = PlannedRun(
+        run_id="run-generate-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, 4096)[0]
+
+    request = ExecutionRequest(
+        run=planned_run,
+        scenario=scenario,
+        execution_mode=ExecutionMode.GENERATE,
+        execution_settings={"seed": 1234, "temperature": 0.2, "top_p": 0.9},
+    )
+
+    options = _OllamaDispatcher(client=object())._build_options(request)
+
+    assert options == {
+        "num_ctx": 4096,
+        "num_predict": scenario.target_output_tokens,
+        "seed": 1234,
+        "temperature": 0.2,
+        "top_p": 0.9,
+    }
+
+
+def test_build_profile_session_plan_defaults_required_execution_settings() -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+    )
+
+    assert plan.execution_settings["seed"] == 42
+    assert plan.execution_settings["temperature"] == 0.0
+    assert plan.execution_settings["repetitions"] == 1
+    assert "top_p" not in plan.execution_settings or plan.execution_settings["top_p"] is None
+
+
+def test_run_profile_session_uses_default_execution_settings_from_profile_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+    )
+    observed_requests: list[ExecutionRequest] = []
+
+    class FakeRunner:
+        def __init__(self, *, execution_settings: dict[str, object], **_: object) -> None:
+            assert execution_settings == {
+                "seed": 42,
+                "temperature": 0.0,
+                "repetitions": 1,
+            }
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, planned_run.context_size)[0]
+            observed_requests.append(
+                ExecutionRequest(
+                    run=planned_run,
+                    scenario=scenario,
+                    execution_mode=ExecutionMode.GENERATE,
+                    execution_settings=plan.execution_settings,
+                )
+            )
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 0, 0, tzinfo=timezone.utc),
+    )
+
+    assert observed_requests[0].execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+    }
+    assert result.summary.session_metrics["completed_runs"] == 1
+
+
+def test_direct_benchmark_session_plan_normalizes_sparse_execution_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        execution_settings={"repetitions": 2},
+    )
+    observed_requests: list[ExecutionRequest] = []
+
+    class FakeRunner:
+        def __init__(self, *, execution_settings: dict[str, object], **_: object) -> None:
+            assert execution_settings == {
+                "seed": 42,
+                "temperature": 0.0,
+                "repetitions": 2,
+            }
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, planned_run.context_size)[0]
+            observed_requests.append(
+                ExecutionRequest(
+                    run=planned_run,
+                    scenario=scenario,
+                    execution_mode=ExecutionMode.GENERATE,
+                    execution_settings=plan.execution_settings,
+                )
+            )
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 5, 0, tzinfo=timezone.utc),
+    )
+
+    assert plan.execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 2,
+    }
+    assert observed_requests[0].execution_settings == plan.execution_settings
+    assert result.summary.session_metrics["completed_runs"] == 2
+
+
+def test_direct_benchmark_session_plan_applies_defaults_when_execution_settings_is_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+    )
+    observed_requests: list[ExecutionRequest] = []
+
+    class FakeRunner:
+        def __init__(self, *, execution_settings: dict[str, object], **_: object) -> None:
+            assert execution_settings == {
+                "seed": 42,
+                "temperature": 0.0,
+                "repetitions": 1,
+            }
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            scenario = build_benchmark_scenarios(BenchmarkType.SMOKE, planned_run.context_size)[0]
+            observed_requests.append(
+                ExecutionRequest(
+                    run=planned_run,
+                    scenario=scenario,
+                    execution_mode=ExecutionMode.GENERATE,
+                    execution_settings=plan.execution_settings,
+                )
+            )
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 10, 0, tzinfo=timezone.utc),
+    )
+
+    assert plan.execution_settings == {
+        "seed": 42,
+        "temperature": 0.0,
+        "repetitions": 1,
+    }
+    assert observed_requests[0].execution_settings == plan.execution_settings
+    assert result.summary.session_metrics["completed_runs"] == 1
+
+
+@pytest.mark.parametrize(
+    ("execution_settings", "expected_message"),
+    [
+        ({"seed": "bad"}, "execution_settings.seed"),
+        ({"temperature": "bad"}, "execution_settings.temperature"),
+        ({"top_p": "bad"}, "execution_settings.top_p"),
+        ({"seed": True}, "execution_settings.seed"),
+        ({"temperature": -0.1}, "execution_settings.temperature"),
+        ({"temperature": 2.1}, "execution_settings.temperature"),
+        ({"top_p": -0.1}, "execution_settings.top_p"),
+        ({"top_p": 1.1}, "execution_settings.top_p"),
+    ],
+)
+def test_benchmark_session_plan_rejects_malformed_execution_settings_values(
+    execution_settings: dict[str, object],
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=expected_message):
+        BenchmarkSessionPlan(
+            model_name="llama3.2",
+            contexts=[4096],
+            benchmark_types=[BenchmarkType.SMOKE],
+            execution_settings=execution_settings,
+        )
+
+
+def test_benchmark_session_plan_rejects_unknown_execution_settings_keys() -> None:
+    with pytest.raises(ValidationError, match="execution_settings.tempertaure"):
+        BenchmarkSessionPlan(
+            model_name="llama3.2",
+            contexts=[4096],
+            benchmark_types=[BenchmarkType.SMOKE],
+            execution_settings={"tempertaure": 0.2},
+        )
+
+
+@pytest.mark.parametrize(
+    ("execution_settings", "expected_message"),
+    [
+        ({"warmup_runs": 0}, "execution_settings.warmup_runs"),
+        ({"warmup_runs": -1}, "execution_settings.warmup_runs"),
+        ({"warmup_runs": "bad"}, "execution_settings.warmup_runs"),
+        ({"warmup_enabled": "bad"}, "execution_settings.warmup_enabled"),
+        ({"warmup_enabled": 1}, "execution_settings.warmup_enabled"),
+    ],
+)
+def test_benchmark_session_plan_rejects_invalid_warmup_execution_settings(
+    execution_settings: dict[str, object],
+    expected_message: str,
+) -> None:
+    with pytest.raises(ValidationError, match=expected_message):
+        BenchmarkSessionPlan(
+            model_name="llama3.2",
+            contexts=[4096],
+            benchmark_types=[BenchmarkType.SMOKE],
+            execution_settings=execution_settings,
+        )
+
+
+def test_ollama_dispatcher_omits_top_p_when_not_requested() -> None:
+    planned_run = PlannedRun(
+        run_id="run-ttft-settings",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.TTFT,
+        benchmark_type_index=1,
+        scenario_id="ttft-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="TTFT probe",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.TTFT, 4096)[0]
+
+    request = ExecutionRequest(
+        run=planned_run,
+        scenario=scenario,
+        execution_mode=ExecutionMode.TTFT,
+        execution_settings={"seed": 4321, "temperature": 0.0},
+    )
+
+    options = _OllamaDispatcher(client=object())._build_options(request)
+
+    assert options["num_ctx"] == 4096
+    assert options["num_predict"] == 8
+    assert options["seed"] == 4321
+    assert options["temperature"] == 0.0
+    assert "top_p" not in options
 
 
 def test_ollama_dispatcher_records_missing_first_token_for_empty_ttft_stream(
@@ -1268,6 +1840,7 @@ def test_ollama_dispatcher_records_missing_first_token_for_empty_ttft_stream(
             run=planned_run,
             scenario=scenario,
             execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
         )
     )
 
@@ -1315,6 +1888,7 @@ def test_ollama_dispatcher_uses_stream_chat_for_chat_ttft_scenarios(
             run=planned_run,
             scenario=scenario,
             execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
         )
     )
 
@@ -1361,6 +1935,7 @@ def test_ollama_dispatcher_does_not_count_empty_non_content_ttft_chunks_as_first
             run=planned_run,
             scenario=scenario,
             execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
         )
     )
 
