@@ -23,7 +23,6 @@ class BenchmarkSessionPlan(BaseModel):
     model_name: str
     contexts: list[int] = Field(min_length=1)
     benchmark_types: list[BenchmarkType] = Field(min_length=1)
-    repetitions: int = Field(default=1, ge=1)
     stop_conditions: list[dict[str, Any]] = Field(default_factory=list)
     started_at: str | None = None
     finished_at: str | None = None
@@ -40,6 +39,20 @@ class BenchmarkSessionPlan(BaseModel):
             raise ValueError("model_name must not be blank")
 
         return model_name
+
+    @field_validator("execution_settings")
+    @classmethod
+    def _validate_execution_settings(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+
+        repetitions = value.get("repetitions")
+        if repetitions is None:
+            return value
+        if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 1:
+            raise ValueError("execution_settings.repetitions must be a positive integer")
+
+        return value
 
 
 class PlannedRun(BaseModel):

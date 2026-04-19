@@ -195,12 +195,13 @@ def expand_session_plan(plan: BenchmarkSessionPlan) -> list[PlannedRun]:
     ordered_benchmark_types = _ordered_benchmark_types(plan.benchmark_types)
     runs: list[PlannedRun] = []
     run_index = 1
+    repetitions = _requested_repetitions(plan)
 
     for context_index, context_size in enumerate(plan.contexts, start=1):
         for benchmark_type_index, benchmark_type in enumerate(ordered_benchmark_types, start=1):
             scenarios = _build_scenarios_for_benchmark(benchmark_type, context_size)
             for scenario_index, scenario in enumerate(scenarios, start=1):
-                for repetition_index in range(1, plan.repetitions + 1):
+                for repetition_index in range(1, repetitions + 1):
                     run_id = _build_run_id(
                         model_name=plan.model_name,
                         context_size=context_size,
@@ -338,12 +339,15 @@ def build_profile_session_plan(
     contexts: list[int],
     benchmark_types: list[BenchmarkType],
     repetitions: int = 1,
+    execution_settings: dict[str, Any] | None = None,
 ) -> BenchmarkSessionPlan:
+    settings = dict(execution_settings) if execution_settings is not None else {"repetitions": repetitions}
+    settings.setdefault("repetitions", repetitions)
     return BenchmarkSessionPlan(
         model_name=model_name,
         contexts=contexts,
         benchmark_types=benchmark_types,
-        repetitions=repetitions,
+        execution_settings=settings,
     )
 
 
@@ -363,7 +367,7 @@ def summarize_session_budget(
         "benchmark_type_count": len(plan.benchmark_types),
         "scenario_count": len(scenario_keys),
         "run_count": run_count,
-        "repetitions": plan.repetitions,
+        "repetitions": _requested_repetitions(plan),
         "warning": _budget_warning(run_count),
     }
 
@@ -445,12 +449,16 @@ def _build_environment_snapshot(
         "executable": python_status.executable,
         "ollama_binary_found": detect_ollama_binary(),
         "host": _build_host_metadata(),
-        "selected_model": plan.model_name,
         "available_models": available_models,
-        "contexts": plan.contexts,
-        "benchmark_types": [benchmark_type.value for benchmark_type in plan.benchmark_types],
-        "repetitions": plan.repetitions,
+        "execution_settings": dict(plan.execution_settings),
     }
+
+
+def _requested_repetitions(plan: BenchmarkSessionPlan) -> int:
+    repetitions = plan.execution_settings.get("repetitions", 1)
+    if isinstance(repetitions, bool) or not isinstance(repetitions, int) or repetitions < 1:
+        raise ValueError("execution_settings.repetitions must be a positive integer")
+    return repetitions
 
 
 def _response_elapsed_ms(

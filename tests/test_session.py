@@ -38,14 +38,31 @@ from ollama_workload_profiler.prompts.scenarios import (
 from ollama_workload_profiler.session import (
     TerminalProgressReporter,
     _OllamaDispatcher,
+    _requested_repetitions,
     build_profile_session_plan,
     expand_session_plan,
     run_profile_session,
+    summarize_session_budget,
 )
 
 
+def _build_session_plan(
+    *,
+    model_name: str,
+    contexts: list[int],
+    benchmark_types: list[BenchmarkType],
+    repetitions: int = 1,
+) -> BenchmarkSessionPlan:
+    return BenchmarkSessionPlan(
+        model_name=model_name,
+        contexts=contexts,
+        benchmark_types=benchmark_types,
+        execution_settings={"repetitions": repetitions},
+    )
+
+
 def test_benchmark_session_plan_serializes_to_json() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[4096, 8192],
         benchmark_types=[BenchmarkType.SMOKE, BenchmarkType.TTFT],
@@ -57,11 +74,33 @@ def test_benchmark_session_plan_serializes_to_json() -> None:
     assert payload["model_name"] == "llama3.2"
     assert payload["contexts"] == [4096, 8192]
     assert payload["benchmark_types"] == ["smoke", "ttft"]
+    assert payload["execution_settings"]["repetitions"] == 2
+    assert "repetitions" not in payload
+
+
+def test_benchmark_session_plan_rejects_top_level_repetitions() -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkSessionPlan(
+            model_name="llama3.2",
+            contexts=[4096],
+            benchmark_types=[BenchmarkType.SMOKE],
+            repetitions=2,
+        )
+
+
+def test_benchmark_session_plan_rejects_invalid_execution_settings_repetitions() -> None:
+    with pytest.raises(ValidationError, match="execution_settings.repetitions"):
+        _build_session_plan(
+            model_name="llama3.2",
+            contexts=[4096],
+            benchmark_types=[BenchmarkType.SMOKE],
+            repetitions=0,
+        )
 
 
 def test_benchmark_session_plan_rejects_blank_model_name() -> None:
     with pytest.raises(ValidationError):
-        BenchmarkSessionPlan(
+        _build_session_plan(
             model_name=" ",
             contexts=[4096],
             benchmark_types=[BenchmarkType.SMOKE],
@@ -70,7 +109,7 @@ def test_benchmark_session_plan_rejects_blank_model_name() -> None:
 
 def test_benchmark_session_plan_rejects_empty_contexts() -> None:
     with pytest.raises(ValidationError):
-        BenchmarkSessionPlan(
+        _build_session_plan(
             model_name="llama3.2",
             contexts=[],
             benchmark_types=[BenchmarkType.SMOKE],
@@ -79,7 +118,7 @@ def test_benchmark_session_plan_rejects_empty_contexts() -> None:
 
 def test_benchmark_session_plan_rejects_empty_benchmark_types() -> None:
     with pytest.raises(ValidationError):
-        BenchmarkSessionPlan(
+        _build_session_plan(
             model_name="llama3.2",
             contexts=[4096],
             benchmark_types=[],
@@ -87,7 +126,7 @@ def test_benchmark_session_plan_rejects_empty_benchmark_types() -> None:
 
 
 def test_expand_session_plan_uses_fixed_benchmark_execution_order_and_is_deterministic() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[8192, 4096],
         benchmark_types=[BenchmarkType.CONTEXT_SCALING, BenchmarkType.SMOKE],
@@ -129,7 +168,7 @@ def test_expand_session_plan_uses_fixed_benchmark_execution_order_and_is_determi
 
 
 def test_expand_session_plan_assigns_repetition_ordering_metadata() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[4096],
         benchmark_types=[BenchmarkType.SMOKE],
@@ -144,8 +183,22 @@ def test_expand_session_plan_assigns_repetition_ordering_metadata() -> None:
     assert runs[0].run_id != runs[1].run_id
 
 
+def test_summarize_session_budget_uses_execution_settings_repetitions() -> None:
+    plan = _build_session_plan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE, BenchmarkType.TTFT],
+        repetitions=4,
+    )
+
+    budget = summarize_session_budget(plan)
+
+    assert budget["repetitions"] == 4
+    assert budget["run_count"] == 12
+
+
 def test_expand_session_plan_keeps_run_ids_unique_for_repeated_contexts() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[4096, 4096],
         benchmark_types=[BenchmarkType.SMOKE],
@@ -160,7 +213,7 @@ def test_expand_session_plan_keeps_run_ids_unique_for_repeated_contexts() -> Non
 
 
 def test_expand_session_plan_keeps_run_ids_unique_when_benchmark_types_repeat_in_the_plan() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[4096],
         benchmark_types=[BenchmarkType.SMOKE, BenchmarkType.SMOKE],
@@ -177,7 +230,7 @@ def test_expand_session_plan_keeps_run_ids_unique_when_benchmark_types_repeat_in
 
 
 def test_expand_session_plan_normalizes_duplicate_benchmark_types_into_fixed_order() -> None:
-    plan = BenchmarkSessionPlan(
+    plan = _build_session_plan(
         model_name="llama3.2",
         contexts=[4096],
         benchmark_types=[
@@ -272,6 +325,91 @@ def test_run_profile_session_uses_supplied_expanded_plan_order_and_appends_raw_r
 
     environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
     assert environment_payload["session_started_at"] == "2026-04-19T10:00:00+00:00"
+    assert environment_payload["execution_settings"]["repetitions"] == 1
+    assert "repetitions" not in environment_payload
+    assert "selected_model" not in environment_payload
+    assert "contexts" not in environment_payload
+    assert "benchmark_types" not in environment_payload
+
+
+def test_run_profile_session_persists_requested_policy_in_environment_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        execution_settings={
+            "repetitions": 3,
+            "seed": 1234,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "warmup_runs": 1,
+            "warmup_enabled": True,
+        },
+    )
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 15, 0, tzinfo=timezone.utc),
+    )
+
+    environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
+    assert environment_payload["execution_settings"] == {
+        "repetitions": 3,
+        "seed": 1234,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "warmup_runs": 1,
+        "warmup_enabled": True,
+    }
+    assert "selected_model" not in environment_payload
+    assert "contexts" not in environment_payload
+    assert "benchmark_types" not in environment_payload
+
+
+def test_requested_repetitions_raises_for_malformed_policy_value() -> None:
+    plan = BenchmarkSessionPlan.model_construct(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        execution_settings={"repetitions": 0},
+    )
+
+    with pytest.raises(ValueError, match="execution_settings.repetitions"):
+        _requested_repetitions(plan)
 
 
 def test_run_profile_session_records_host_metadata_and_per_run_system_snapshot(

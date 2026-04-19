@@ -10,6 +10,7 @@ import tomllib
 import pytest
 
 from ollama_workload_profiler.models.results import RunResult, RunState
+from ollama_workload_profiler.models.plan import BenchmarkSessionPlan, BenchmarkType
 from ollama_workload_profiler.models.failures import FailureInfo
 from ollama_workload_profiler.models.summary import ReportSummary
 from ollama_workload_profiler.reporting.artifacts import write_session_artifacts
@@ -40,6 +41,43 @@ def test_write_session_artifacts_creates_fixed_filenames(tmp_path: Path) -> None
     assert (output_dir / "raw.csv").exists()
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "report.md").exists()
+
+
+def test_write_session_artifacts_persists_execution_settings_as_requested_policy(tmp_path: Path) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        execution_settings={
+            "repetitions": 3,
+            "seed": 1234,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "warmup_runs": 1,
+            "warmup_enabled": True,
+        },
+    )
+    summary = build_report_summary(plan=plan, environment={}, runs=[])
+
+    output_dir = write_session_artifacts(
+        tmp_path,
+        session_timestamp=datetime(2026, 4, 18, 12, 0, 0, tzinfo=timezone.utc),
+        plan=plan,
+        expanded_plan=[],
+        environment={},
+        runs=[],
+        summary=summary,
+        report_markdown=render_markdown_report(summary),
+    )
+
+    plan_payload = json.loads((output_dir / "plan.json").read_text(encoding="utf-8"))
+    assert plan_payload["execution_settings"]["repetitions"] == 3
+    assert plan_payload["execution_settings"]["seed"] == 1234
+    assert plan_payload["execution_settings"]["temperature"] == 0.2
+    assert plan_payload["execution_settings"]["top_p"] == 0.9
+    assert plan_payload["execution_settings"]["warmup_runs"] == 1
+    assert plan_payload["execution_settings"]["warmup_enabled"] is True
+    assert "repetitions" not in plan_payload
 
 
 def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(tmp_path: Path) -> None:
