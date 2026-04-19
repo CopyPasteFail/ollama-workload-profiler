@@ -37,6 +37,7 @@ This pass stays intentionally local-first and practical:
 - Labels must match enforced behavior. If the tool says "cold", the code must perform explicit cold-state preparation.
 - Approximate measurements must be labeled as approximate.
 - Benchmark settings must be first-class artifact data, not hidden inside unrelated metadata blobs.
+- Requested policy and actual behavior must both be visible in artifacts.
 - Summary numbers should discourage cherry-picking by default.
 - Bounded extra work is acceptable for better honesty; unbounded calibration loops are not.
 
@@ -70,7 +71,7 @@ Benchmark settings become a distinct first-class artifact contract.
 - `warmup_enabled`
 - calibration bounds and tolerance if exposed or internally fixed
 
-This is the user's requested benchmark policy.
+This is the authoritative source of requested benchmark policy. `repetitions` should not remain as a second authoritative top-level run-policy field once this pass is implemented; report-level copies are derived views only.
 
 ### `environment.json`
 
@@ -85,11 +86,14 @@ This is the user's requested benchmark policy.
 
 Each run row in `raw.jsonl` and `raw.csv` records:
 
+- `requested_execution_settings`
+- `effective_execution_settings`
 - requested prep behavior
 - actual prep method used
 - whether prep enforcement succeeded
 - calibration target, actual prompt tokens, and calibration status when applicable
 - deterministic generation settings used for the request
+- sample eligibility flags for strict aggregates, such as cold-start eligibility, TTFT eligibility, and calibrated-context eligibility
 
 If cold-state enforcement or calibration fails, the run is still recorded, but the artifacts must say so explicitly.
 
@@ -107,6 +111,8 @@ The CLI exposes:
 These settings feed `BenchmarkSessionPlan.execution_settings` and are echoed in the benchmark budget output so the user sees the benchmark policy before execution starts.
 
 `_OllamaDispatcher._build_options()` uses these settings for every measured request, with `tokens_per_second` retained only as a backward-compatible alias of generation TPS.
+
+Per-run artifacts must distinguish between requested and effective execution settings. This matters when runtime policy adjusts a request, such as TTFT enforcing a higher effective `num_predict` than the requested scenario target.
 
 ## Cold, Warm, And Warmup Semantics
 
@@ -138,13 +144,30 @@ For non-cold benchmark families, the session performs silent warmup per context 
 
 Warmup policy:
 
-- Warmup is tracked per selected context size, not once per session
+- Warmup is applied once per `(model, context_size)` boundary for non-cold scenarios unless disabled
+- Warmup is tracked per selected model and context boundary, not once per session
 - Default is one short silent warmup request per context size before the first measured run at that context
 - `--warmup-runs` controls how many silent warmup runs happen
 - `--no-warmup` disables this behavior entirely
 - Cold scenarios bypass this default warmup path so they remain truly cold attempts
 
 ## Metric Model
+
+### Canonical metric contract
+
+Canonical per-run metric fields for this pass are:
+
+- `load_duration_ms`
+- `prompt_eval_count`
+- `prompt_eval_duration`
+- `eval_count`
+- `eval_duration`
+- `prompt_tokens_per_second`
+- `generation_tokens_per_second`
+- `tokens_per_second` as a backward-compatible alias of `generation_tokens_per_second`
+- `ttft_first_emission_ms`
+
+`ttft_first_answer_ms` is not required for this pass, but the naming contract should leave room for it as a future addition without redefining the meaning of `ttft_first_emission_ms`.
 
 Per-run response metrics expand to include:
 
@@ -194,7 +217,7 @@ Calibration must be cached. The cache key should include at least:
 - model name
 - context size
 - scenario id or fill ratio
-- generation settings that materially affect tokenization if any
+- prompt-template version
 
 The cache may live in memory for the session; persistent cross-session caching is not required for this pass.
 
@@ -202,9 +225,10 @@ The cache may live in memory for the session; persistent cross-session caching i
 
 Calibration must not run indefinitely. The design uses:
 
-- a fixed maximum attempt count
+- a fixed maximum attempt count in the range of 3 to 5 tries
 - a tolerance such as plus or minus five percent
 - explicit fallback recording when calibration does not converge
+- `calibration_status` values of `exact`, `approximate`, or `failed`
 
 If calibration does not converge, the scenario still runs, but the artifacts and reports must say that the fill is approximate and include requested versus actual prompt token counts.
 
@@ -232,9 +256,13 @@ The environment snapshot grows to answer the questions a blog reader will immedi
 
 Metadata collection is best-effort and non-fatal. Missing commands or unavailable Ollama fields are recorded as unavailable, not fabricated.
 
+Accelerator, VRAM, and some model or runtime metadata are best-effort and may be partially unavailable depending on platform and local tooling.
+
 ## Aggregate Reporting
 
 Aggregate summaries should reflect completed runs only and include sample size.
+
+Headline benchmark aggregates should use completed runs with successful preparation or explicitly accepted approximate preparation. Runs with failed enforcement remain in raw artifacts but are excluded from strict benchmark aggregates unless a report section explicitly says it is using inclusive counts.
 
 ### Session and benchmark summaries
 
