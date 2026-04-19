@@ -43,6 +43,23 @@ class OllamaClient:
         payload = response.json()
         return [model["name"] for model in payload.get("models", [])]
 
+    def version(self) -> str:
+        response = self._client.get("/api/version")
+        response.raise_for_status()
+        payload = response.json()
+        version = payload.get("version")
+        if not isinstance(version, str):
+            raise ValueError("Ollama version response did not include a string version")
+        return version
+
+    def show_model(self, model_name: str) -> dict[str, Any]:
+        response = self._client.post("/api/show", json={"name": model_name})
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Ollama show response was not a JSON object")
+        return payload
+
     def generate(
         self,
         *,
@@ -114,6 +131,32 @@ class OllamaClient:
             options=options,
             stream=True,
         )
+
+    def unload_model(self, *, model: str) -> dict[str, Any]:
+        response = self._client.post(
+            "/api/generate",
+            json={"model": model, "keep_alive": 0},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def preload_model(
+        self,
+        *,
+        model: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "keep_alive": -1,
+            "prompt": "",
+            "stream": False,
+        }
+        if options:
+            payload["options"] = dict(options)
+        response = self._client.post("/api/generate", json=payload)
+        response.raise_for_status()
+        return response.json()
 
     def _build_generate_payload(
         self,

@@ -6,6 +6,7 @@ import pytest
 from typer import BadParameter
 from typer.testing import CliRunner
 
+from ollama_workload_profiler.methodology import BENCHMARK_METHODOLOGY_VERSION
 from ollama_workload_profiler.cli import (
     _build_terminal_echo,
     app,
@@ -43,6 +44,168 @@ def test_profile_help_includes_benchmark_policy_flags() -> None:
     assert "--repetitions" in result.stdout
     assert "--warmup-runs" in result.stdout
     assert "--no-warmup" in result.stdout
+
+
+def _write_compare_json(path: Path, payload: object) -> None:
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_compare_session(path: Path, *, temperature: float = 0.0) -> None:
+    path.mkdir()
+    execution_settings = {
+        "seed": 42,
+        "temperature": temperature,
+        "top_p": None,
+        "repetitions": 1,
+        "warmup_runs": 1,
+        "warmup_enabled": True,
+    }
+    _write_compare_json(
+        path / "summary.json",
+        {
+            "benchmark_methodology_version": BENCHMARK_METHODOLOGY_VERSION,
+            "session_metrics": {
+                "run_count": 1,
+                "completed_runs": 1,
+                "failed_runs": 0,
+                "stopped_runs": 0,
+                "completed_sample_size": 1,
+                "elapsed_ms_median": 100.0,
+                "elapsed_ms_p95": 100.0,
+                "elapsed_ms_sample_size": 1,
+            },
+            "benchmark_summaries": [
+                {
+                    "model_name": "llama3.2",
+                    "context_size": 4096,
+                    "benchmark_type": "smoke",
+                    "scenario_id": "smoke-basic-v1",
+                    "strict_sample_size": 1,
+                    "elapsed_ms_median": 100.0,
+                    "elapsed_ms_p95": 100.0,
+                    "elapsed_ms_sample_size": 1,
+                }
+            ],
+        },
+    )
+    _write_compare_json(
+        path / "plan.json",
+        {
+            "benchmark_methodology_version": BENCHMARK_METHODOLOGY_VERSION,
+            "model_name": "llama3.2",
+            "contexts": [4096],
+            "benchmark_types": ["smoke"],
+            "execution_settings": execution_settings,
+        },
+    )
+    _write_compare_json(
+        path / "environment.json",
+        {
+            "benchmark_methodology_version": BENCHMARK_METHODOLOGY_VERSION,
+            "execution_settings": execution_settings,
+        },
+    )
+
+
+def test_compare_help_is_available() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare", "--help"])
+
+    assert result.exit_code == 0
+    assert "--format" in result.stdout
+    assert "--strict" in result.stdout
+    assert "--output" in result.stdout
+    assert "--all-metrics" in result.stdout
+
+
+def test_compare_strict_returns_nonzero_for_strict_blocking_warnings(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    _write_compare_session(baseline, temperature=0.0)
+    _write_compare_session(candidate, temperature=0.2)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare", str(baseline), str(candidate), "--strict"])
+
+    assert result.exit_code == 1
+    assert "Strict comparison failed:" in result.stdout
+    assert "execution_policy.temperature_mismatch" in result.stdout
+
+
+def test_compare_writes_selected_format_to_output_and_prints_completion_line(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    output_path = tmp_path / "compare.json"
+    _write_compare_session(baseline)
+    _write_compare_session(candidate)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "compare",
+            str(baseline),
+            str(candidate),
+            "--format",
+            "json",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert f"Comparison written to: {output_path}" in result.stdout
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["comparability_status"] == "pass"
+
+
+def test_compare_output_creates_missing_parent_directories(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    output_path = tmp_path / "nested" / "reports" / "compare.txt"
+    _write_compare_session(baseline)
+    _write_compare_session(candidate)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare", str(baseline), str(candidate), "--output", str(output_path)])
+
+    assert result.exit_code == 0
+    assert output_path.exists()
+    assert f"Comparison written to: {output_path}" in result.stdout
+
+
+def test_compare_default_output_includes_human_sections(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    _write_compare_session(baseline)
+    _write_compare_session(candidate)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["compare", str(baseline), str(candidate)])
+
+    assert result.exit_code == 0
+    assert "Comparison: baseline -> candidate" in result.stdout
+    assert "Warnings:" in result.stdout
+    assert "Session Summary:" in result.stdout
+    assert "Rows:" in result.stdout
+    assert "Unmatched Rows:" in result.stdout
+
+
+def test_compare_all_metrics_shows_unavailable_and_unchanged_metrics(tmp_path: Path) -> None:
+    baseline = tmp_path / "baseline"
+    candidate = tmp_path / "candidate"
+    _write_compare_session(baseline)
+    _write_compare_session(candidate)
+
+    runner = CliRunner()
+    default_result = runner.invoke(app, ["compare", str(baseline), str(candidate)])
+    all_metrics_result = runner.invoke(app, ["compare", str(baseline), str(candidate), "--all-metrics"])
+
+    assert default_result.exit_code == 0
+    assert all_metrics_result.exit_code == 0
+    assert "No changed metrics." in default_result.stdout
+    assert "elapsed_ms_median" not in default_result.stdout
+    assert "elapsed_ms_median" in all_metrics_result.stdout
 
 
 def test_profile_rejects_out_of_range_temperature_before_plan_construction(
@@ -228,6 +391,7 @@ def test_profile_command_parses_and_echoes_options(
     assert "Model: llama3.2" in result.stdout
     assert "Contexts: 8192, 4096" in result.stdout
     assert "Benchmark types: context-scaling, smoke" in result.stdout
+    assert f"Benchmark methodology: {BENCHMARK_METHODOLOGY_VERSION}" in result.stdout
 
 
 def test_profile_command_passes_requested_execution_settings(
@@ -446,6 +610,54 @@ def test_profile_interactive_flow_allows_user_to_cancel_before_execution(
     assert "Proceed with this benchmark session?" in result.stdout
     assert "Profile session cancelled." in result.stdout
     assert list(tmp_path.iterdir()) == []
+
+
+def test_profile_yes_flag_skips_confirmation_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class FakeClient:
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def list_models(self) -> list[str]:
+            return ["llama3.2"]
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            return {
+                "response": "ok",
+                "total_duration": 1_000_000,
+                "eval_count": 4,
+                "eval_duration": 250_000,
+                "prompt_eval_count": 8,
+                "prompt_eval_duration": 500_000,
+            }
+
+    monkeypatch.setattr("ollama_workload_profiler.cli.OllamaClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "profile",
+            "--model",
+            "llama3.2",
+            "--contexts",
+            "4096",
+            "--benchmark-types",
+            "smoke",
+            "--yes",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Proceed with this benchmark session?" not in result.stdout
+    assert "Session artifacts written to:" in result.stdout
 
 
 def test_profile_writes_session_artifacts_on_happy_path(

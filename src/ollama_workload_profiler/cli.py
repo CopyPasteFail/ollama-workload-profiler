@@ -14,8 +14,15 @@ from .env_check import (
     probe_ollama_server,
     summarize_doctor_status,
 )
+from .methodology import BENCHMARK_METHODOLOGY_VERSION
 from .models.plan import BenchmarkType
 from .ollama_client import OllamaClient
+from .reporting.compare import (
+    CompareArtifactError,
+    compare_sessions,
+    render_compare_json,
+    render_compare_text,
+)
 from .session import (
     build_profile_session_plan,
     expand_session_plan,
@@ -26,6 +33,11 @@ from .session import (
 
 app = typer.Typer(help="Profile local Ollama workloads.")
 _SUPPORTED_BENCHMARK_TYPES: tuple[BenchmarkType, ...] = tuple(BenchmarkType)
+
+
+class CompareOutputFormat(str):
+    TEXT = "text"
+    JSON = "json"
 
 
 def _build_terminal_echo() -> Callable[[str, bool], None]:
@@ -187,6 +199,66 @@ def doctor() -> None:
 
 
 @app.command()
+def compare(
+    baseline_session_dir: Annotated[
+        Path,
+        typer.Argument(help="Baseline completed benchmark session directory."),
+    ],
+    candidate_session_dir: Annotated[
+        Path,
+        typer.Argument(help="Candidate completed benchmark session directory."),
+    ],
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: text or json."),
+    ] = CompareOutputFormat.TEXT,
+    output: Annotated[
+        Path | None,
+        typer.Option("--output", help="Write comparison output to this file."),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option("--strict", help="Return nonzero for strict-blocking comparability issues."),
+    ] = False,
+    all_metrics: Annotated[
+        bool,
+        typer.Option("--all-metrics", help="Show unchanged and unavailable metrics in text output."),
+    ] = False,
+) -> None:
+    """Compare two completed benchmark sessions."""
+    if output_format not in {CompareOutputFormat.TEXT, CompareOutputFormat.JSON}:
+        typer.echo("Invalid --format. Use 'text' or 'json'.")
+        raise typer.Exit(code=2)
+
+    try:
+        result = compare_sessions(
+            baseline_dir=baseline_session_dir,
+            candidate_dir=candidate_session_dir,
+        )
+    except CompareArtifactError as exc:
+        typer.echo(f"Compare failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    rendered = (
+        render_compare_json(result)
+        if output_format == CompareOutputFormat.JSON
+        else render_compare_text(result, all_metrics=all_metrics)
+    )
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered, encoding="utf-8")
+        typer.echo(f"Comparison written to: {output}")
+    else:
+        typer.echo(rendered, nl=False)
+
+    if strict and result.strict_failure_reasons:
+        typer.echo("Strict comparison failed:")
+        for reason in result.strict_failure_reasons:
+            typer.echo(f"- {reason}")
+        raise typer.Exit(code=1)
+
+
+@app.command()
 def profile(
     model: Annotated[str | None, typer.Option("--model", help="Model to profile.")] = None,
     contexts: Annotated[str | None, typer.Option("--contexts", help="Comma-separated context sizes.")] = None,
@@ -230,6 +302,13 @@ def profile(
         typer.Option(
             "--live-progress",
             help="Show live benchmark status, telemetry, and per-run summaries.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            help="Skip the final benchmark session confirmation prompt.",
         ),
     ] = False,
     output_dir: Path = typer.Option(
@@ -302,7 +381,7 @@ def profile(
         )
         if budget["warning"] is not None:
             typer.echo(f"Budget warning: {budget['warning']}")
-        if not typer.confirm("Proceed with this benchmark session?", default=True):
+        if not yes and not typer.confirm("Proceed with this benchmark session?", default=True):
             typer.echo("Profile session cancelled.")
             raise typer.Exit(code=1)
 
@@ -318,6 +397,7 @@ def profile(
             ),
         )
 
+    typer.echo(f"Benchmark methodology: {BENCHMARK_METHODOLOGY_VERSION}")
     typer.echo(f"Session artifacts written to: {result.session_dir}")
 
 

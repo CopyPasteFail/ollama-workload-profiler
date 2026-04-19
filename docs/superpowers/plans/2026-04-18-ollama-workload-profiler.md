@@ -107,7 +107,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ollama-workload-profiler"
-version = "0.1.0"
+version = "0.2.0"
 description = "CLI-first local benchmarking and profiling for Ollama"
 readme = "README.md"
 requires-python = ">=3.11"

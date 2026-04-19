@@ -16,16 +16,20 @@ from typing import Any
 
 import psutil
 
-from .benchmarks import build_scenarios_for_benchmark
+from .benchmarks import build_scenarios_for_benchmark, resolve_benchmark_family
 from .benchmarks.base import BenchmarkRunner, ExecutionMode, ExecutionRequest, ExecutionResult
-from .env_check import detect_ollama_binary, detect_python_environment
+from .env_check import (
+    detect_accelerator_metadata,
+    detect_ollama_binary,
+    detect_python_environment,
+)
 from .metrics.process import find_ollama_processes
 from .metrics.sampler import PollingProcessSampler
 from .models.plan import BenchmarkSessionPlan, BenchmarkType, PlannedRun
 from .models.results import RunResult, RunState
 from .models.summary import ReportSummary
 from .ollama_client import OllamaClient
-from .prompts.scenarios import MultiTurnChatPromptPayload, ScenarioDefinition
+from .prompts.scenarios import MultiTurnChatPromptPayload, ScenarioDefinition, TextPromptPayload, _repeat_to_length
 from .reporting import (
     append_run_artifact,
     build_report_summary,
@@ -190,6 +194,9 @@ BENCHMARK_EXECUTION_ORDER: tuple[BenchmarkType, ...] = (
     BenchmarkType.STRESS,
 )
 
+CALIBRATION_MAX_ATTEMPTS = 4
+CALIBRATION_TOLERANCE_RATIO = 0.05
+
 
 def expand_session_plan(plan: BenchmarkSessionPlan) -> list[PlannedRun]:
     ordered_benchmark_types = _ordered_benchmark_types(plan.benchmark_types)
@@ -242,9 +249,343 @@ class ProfileSessionResult:
     summary: ReportSummary
 
 
+def _build_execution_options(
+    *,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    execution_mode: ExecutionMode,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "num_ctx": planned_run.context_size,
+        "num_predict": scenario.target_output_tokens,
+        "seed": execution_settings["seed"],
+        "temperature": execution_settings["temperature"],
+    }
+
+    top_p = execution_settings.get("top_p")
+    if top_p is not None:
+        options["top_p"] = top_p
+
+    if execution_mode is ExecutionMode.TTFT:
+        # Some Ollama models collapse `num_predict=1` into a terminal metadata
+        # chunk with no observable streamed token, so TTFT uses a small floor.
+        options["num_predict"] = max(8, scenario.target_output_tokens)
+
+    return options
+
+
+def _calibration_cache_key(planned_run: PlannedRun, scenario: ScenarioDefinition) -> tuple[str, int, str, str]:
+    return (
+        planned_run.model_name,
+        planned_run.context_size,
+        scenario.scenario_id,
+        scenario.prompt_template_version or scenario.version or "v1",
+    )
+
+
+def _within_calibration_tolerance(actual_prompt_tokens: int, target_prompt_tokens: int) -> bool:
+    if target_prompt_tokens <= 0:
+        return False
+    tolerance = max(1, int(round(target_prompt_tokens * CALIBRATION_TOLERANCE_RATIO)))
+    return abs(actual_prompt_tokens - target_prompt_tokens) <= tolerance
+
+
+def _next_calibration_candidate_length(
+    candidate_length: int,
+    actual_prompt_tokens: int,
+    target_prompt_tokens: int,
+) -> int:
+    if actual_prompt_tokens <= 0:
+        return max(candidate_length + target_prompt_tokens, candidate_length * 2, 1)
+
+    next_length = int(round(candidate_length * (target_prompt_tokens / actual_prompt_tokens)))
+    return max(1, next_length)
+
+
+def _calibrate_context_prompt(
+    *,
+    client: OllamaClient,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    options: Mapping[str, Any],
+    calibration_cache: dict[tuple[str, int, str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    if not isinstance(scenario.prompt_payload, TextPromptPayload):
+        return {
+            "prompt": scenario.prompt_payload,
+            "requested_fill_ratio": scenario.fill_ratio,
+            "target_prompt_tokens": scenario.target_prompt_tokens,
+            "actual_prompt_tokens": None,
+            "calibration_status": "failed",
+            "calibration_attempts": 0,
+            "calibration_cache_hit": False,
+        }
+
+    cache_key = _calibration_cache_key(planned_run, scenario)
+    cached_entry = calibration_cache.get(cache_key)
+    if cached_entry is not None:
+        return {
+            **cached_entry,
+            "calibration_cache_hit": True,
+        }
+
+    target_prompt_tokens = scenario.target_prompt_tokens or planned_run.context_size
+    base_text = scenario.prompt_payload.text
+    candidate_length = max(1, target_prompt_tokens)
+    probe_options = dict(options)
+    probe_options["num_predict"] = 1
+
+    calibration_status = "failed"
+    actual_prompt_tokens: int | None = None
+    prompt = _repeat_to_length(base_text, candidate_length)
+    attempts = 0
+
+    for attempt in range(1, CALIBRATION_MAX_ATTEMPTS + 1):
+        attempts = attempt
+        response = client.generate(
+            model=planned_run.model_name,
+            prompt=prompt,
+            options=probe_options,
+        )
+        actual_prompt_value = response.get("prompt_eval_count")
+        if not isinstance(actual_prompt_value, (int, float)) or isinstance(actual_prompt_value, bool):
+            calibration_status = "failed"
+            break
+
+        actual_prompt_tokens = int(actual_prompt_value)
+        if _within_calibration_tolerance(actual_prompt_tokens, target_prompt_tokens):
+            calibration_status = "exact"
+            break
+
+        calibration_status = "approximate"
+        candidate_length = _next_calibration_candidate_length(
+            candidate_length,
+            actual_prompt_tokens,
+            target_prompt_tokens,
+        )
+        prompt = _repeat_to_length(base_text, candidate_length)
+
+    cached_entry = {
+        "prompt": prompt,
+        "requested_fill_ratio": scenario.fill_ratio,
+        "target_prompt_tokens": target_prompt_tokens,
+        "actual_prompt_tokens": actual_prompt_tokens,
+        "calibration_status": calibration_status,
+        "calibration_attempts": attempts,
+        "calibration_cache_hit": False,
+    }
+    calibration_cache[cache_key] = dict(cached_entry)
+    return cached_entry
+
+
+def _resolve_planned_scenario(planned_run: PlannedRun) -> ScenarioDefinition:
+    for scenario in _build_scenarios_for_benchmark(planned_run.benchmark_type, planned_run.context_size):
+        if scenario.scenario_id == planned_run.scenario_id:
+            return scenario
+    raise ValueError(
+        f"Unknown scenario {planned_run.scenario_id!r} for benchmark "
+        f"{planned_run.benchmark_type.value}"
+    )
+
+
+def _warmup_runs_requested(execution_settings: Mapping[str, Any]) -> int:
+    warmup_runs = execution_settings.get("warmup_runs", 1)
+    if isinstance(warmup_runs, bool) or not isinstance(warmup_runs, int) or warmup_runs < 1:
+        raise ValueError("execution_settings.warmup_runs must be a positive integer")
+    return warmup_runs
+
+
+def _warmup_context_boundary(
+    *,
+    client: OllamaClient,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    execution_mode: ExecutionMode,
+) -> bool:
+    options = _build_execution_options(
+        planned_run=planned_run,
+        scenario=scenario,
+        execution_settings=execution_settings,
+        execution_mode=execution_mode,
+    )
+
+    prompt_payload = scenario.prompt_payload
+    if isinstance(prompt_payload, MultiTurnChatPromptPayload):
+        client.chat(
+            model=planned_run.model_name,
+            messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
+            options=options,
+        )
+    else:
+        client.generate(
+            model=planned_run.model_name,
+            prompt=prompt_payload.text,
+            options=options,
+        )
+    return True
+
+
+def _prepare_run_preference(
+    *,
+    client: OllamaClient,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    warmed_contexts: set[tuple[str, int]],
+) -> dict[str, Any]:
+    boundary_key = (planned_run.model_name, planned_run.context_size)
+    execution_mode = resolve_benchmark_family(planned_run.benchmark_type).execution_mode
+    warmup_enabled = execution_settings.get("warmup_enabled", True)
+
+    if planned_run.benchmark_type is BenchmarkType.COLD_WARM and scenario.profile_tag == "cold_start":
+        try:
+            client.unload_model(model=planned_run.model_name)
+            return {
+                "requested_prep_behavior": "cold_start",
+                "actual_prep_method": "explicit_unload",
+                "prep_enforcement_succeeded": True,
+            }
+        except Exception:
+            return {
+                "requested_prep_behavior": "cold_start",
+                "actual_prep_method": "explicit_unload_failed",
+                "prep_enforcement_succeeded": False,
+            }
+
+    if planned_run.benchmark_type is BenchmarkType.COLD_WARM and scenario.profile_tag == "warm_start":
+        try:
+            client.preload_model(
+                model=planned_run.model_name,
+                options=_build_execution_options(
+                    planned_run=planned_run,
+                    scenario=scenario,
+                    execution_settings=execution_settings,
+                    execution_mode=execution_mode,
+                ),
+            )
+            return {
+                "requested_prep_behavior": "warm_start",
+                "actual_prep_method": "explicit_preload",
+                "prep_enforcement_succeeded": True,
+            }
+        except Exception:
+            return {
+                "requested_prep_behavior": "warm_start",
+                "actual_prep_method": "explicit_preload_failed",
+                "prep_enforcement_succeeded": False,
+            }
+
+    if planned_run.benchmark_type is BenchmarkType.CONTEXT_SCALING:
+        return {
+            "requested_prep_behavior": "calibrated_context_fill",
+            "actual_prep_method": "calibration",
+            "prep_enforcement_succeeded": True,
+        }
+
+    if boundary_key in warmed_contexts:
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "already_warm",
+            "prep_enforcement_succeeded": True,
+        }
+
+    if not warmup_enabled:
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "warmup_disabled",
+            "prep_enforcement_succeeded": False,
+        }
+
+    warmup_method = "chat" if isinstance(scenario.prompt_payload, MultiTurnChatPromptPayload) else "generate"
+    if not hasattr(client, warmup_method):
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "warmup_unavailable",
+            "prep_enforcement_succeeded": False,
+        }
+
+    warmup_runs = _warmup_runs_requested(execution_settings)
+    warmup_success = True
+    for _ in range(warmup_runs):
+        try:
+            _warmup_context_boundary(
+                client=client,
+                planned_run=planned_run,
+                scenario=scenario,
+                execution_settings=execution_settings,
+                execution_mode=execution_mode,
+            )
+        except Exception:
+            warmup_success = False
+            break
+
+    if warmup_success:
+        warmed_contexts.add(boundary_key)
+    return {
+        "requested_prep_behavior": "session_warmup",
+        "actual_prep_method": "session_warmup" if warmup_success else "session_warmup_failed",
+        "prep_enforcement_succeeded": warmup_success,
+        }
+
+
+def _build_prep_eligibility_metadata(
+    *,
+    run_result: RunResult,
+    prep_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    prep_succeeded = bool(prep_metadata.get("prep_enforcement_succeeded"))
+    requested_behavior = prep_metadata.get("requested_prep_behavior")
+    completed = run_result.state is RunState.COMPLETED
+    metrics = run_result.metrics
+    calibration_status = metrics.get("calibration_status")
+    ttft_first_emission_ms = metrics.get("ttft_first_emission_ms", metrics.get("ttft_ms"))
+
+    calibrated_context_eligible = bool(
+        completed
+        and calibration_status in {"exact", "approximate"}
+    )
+    strict_aggregate_eligible = bool(
+        completed
+        and (
+            prep_succeeded
+            or calibration_status == "approximate"
+        )
+        and calibration_status != "failed"
+    )
+
+    metadata: dict[str, Any] = {
+        "eligible_for_strict_aggregate": strict_aggregate_eligible,
+        "eligible_for_cold_start_aggregate": bool(
+            completed and prep_succeeded and requested_behavior == "cold_start"
+        ),
+        "eligible_for_ttft_aggregate": bool(
+            completed and isinstance(ttft_first_emission_ms, int | float)
+        ),
+        "eligible_for_calibrated_context_aggregate": calibrated_context_eligible,
+    }
+    return metadata
+
+
 class _OllamaDispatcher:
-    def __init__(self, client: OllamaClient) -> None:
+    def __init__(
+        self,
+        client: OllamaClient,
+        *,
+        calibration_cache: dict[tuple[str, int, str, str], dict[str, Any]] | None = None,
+    ) -> None:
         self._client = client
+        self._calibration_cache = calibration_cache if calibration_cache is not None else {}
+
+    def _build_options(self, request: ExecutionRequest) -> dict[str, Any]:
+        return _build_execution_options(
+            planned_run=request.run,
+            scenario=request.scenario,
+            execution_settings=request.execution_settings,
+            execution_mode=request.execution_mode,
+        )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         prompt_payload = request.scenario.prompt_payload
@@ -261,33 +602,53 @@ class _OllamaDispatcher:
             metrics.update(stream_metrics)
             return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
 
+        options = _build_execution_options(
+            planned_run=request.run,
+            scenario=request.scenario,
+            execution_settings=request.execution_settings,
+            execution_mode=request.execution_mode,
+        )
+        calibration_metrics: dict[str, Any] = {}
+        if (
+            request.run.benchmark_type is BenchmarkType.CONTEXT_SCALING
+            and isinstance(prompt_payload, TextPromptPayload)
+        ):
+            calibration = _calibrate_context_prompt(
+                client=self._client,
+                planned_run=request.run,
+                scenario=request.scenario,
+                execution_settings=request.execution_settings,
+                options=options,
+                calibration_cache=self._calibration_cache,
+            )
+            prompt = calibration.pop("prompt")
+            calibration_metrics.update(calibration)
+        else:
+            prompt = prompt_payload.text if isinstance(prompt_payload, TextPromptPayload) else None
+
         if isinstance(prompt_payload, MultiTurnChatPromptPayload):
             response = self._client.chat(
                 model=request.run.model_name,
                 messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
-                options=self._build_options(request),
+                options=options,
             )
-        else:
+        elif prompt is not None:
             response = self._client.generate(
                 model=request.run.model_name,
-                prompt=prompt_payload.text,
-                options=self._build_options(request),
+                prompt=prompt,
+                options=options,
             )
+        else:
+            raise TypeError(f"Unsupported prompt payload: {type(prompt_payload)!r}")
 
         elapsed_ms = _response_elapsed_ms(response, started_at)
         metrics = _response_metrics(response)
+        if calibration_metrics:
+            metrics.update(calibration_metrics)
+            prompt_eval_count = metrics.get("prompt_eval_count")
+            if isinstance(prompt_eval_count, (int, float)) and not isinstance(prompt_eval_count, bool):
+                metrics["actual_prompt_tokens"] = int(prompt_eval_count)
         return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
-
-    def _build_options(self, request: ExecutionRequest) -> dict[str, Any]:
-        options: dict[str, Any] = {
-            "num_ctx": request.run.context_size,
-            "num_predict": request.scenario.target_output_tokens,
-        }
-        if request.execution_mode is ExecutionMode.TTFT:
-            # Some Ollama models collapse `num_predict=1` into a terminal metadata
-            # chunk with no observable streamed token, so TTFT uses a small floor.
-            options["num_predict"] = max(8, request.scenario.target_output_tokens)
-        return options
 
     def _execute_ttft_stream(
         self,
@@ -338,11 +699,18 @@ def build_profile_session_plan(
     model_name: str,
     contexts: list[int],
     benchmark_types: list[BenchmarkType],
+    seed: int = 42,
+    temperature: float = 0.0,
+    top_p: float | None = None,
     repetitions: int = 1,
     execution_settings: dict[str, Any] | None = None,
 ) -> BenchmarkSessionPlan:
-    settings = dict(execution_settings) if execution_settings is not None else {"repetitions": repetitions}
+    settings = dict(execution_settings) if execution_settings is not None else {}
+    settings.setdefault("seed", seed)
+    settings.setdefault("temperature", temperature)
     settings.setdefault("repetitions", repetitions)
+    if top_p is not None:
+        settings.setdefault("top_p", top_p)
     return BenchmarkSessionPlan(
         model_name=model_name,
         contexts=contexts,
@@ -387,15 +755,18 @@ def run_profile_session(
 
     timestamp = session_timestamp or datetime.now(timezone.utc)
     planned_runs = list(expanded_plan) if expanded_plan is not None else expand_session_plan(plan)
+    calibration_cache: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     runner = BenchmarkRunner(
-        dispatcher=_OllamaDispatcher(client),
+        dispatcher=_OllamaDispatcher(client, calibration_cache=calibration_cache),
         sampler_factory=lambda: PollingProcessSampler(process_finder=find_ollama_processes),
+        execution_settings=plan.execution_settings,
     )
 
     environment = _build_environment_snapshot(
         plan=plan,
         available_models=available_models if available_models is not None else client.list_models(),
         session_timestamp=timestamp,
+        client=client,
     )
     session_dir = initialize_session_artifacts(
         session_root,
@@ -407,11 +778,32 @@ def run_profile_session(
 
     runs: list[RunResult] = []
     reporter = progress_reporter or ProgressReporter()
+    warmed_contexts: set[tuple[str, int]] = set()
     for planned_run in planned_runs:
         reporter.on_run_started(planned_run, total_runs=len(planned_runs))
+        scenario = _resolve_planned_scenario(planned_run)
+        prep_metadata = _prepare_run_preference(
+            client=client,
+            planned_run=planned_run,
+            scenario=scenario,
+            execution_settings=plan.execution_settings,
+            warmed_contexts=warmed_contexts,
+        )
         run_system_snapshot = _build_run_system_snapshot()
         run_result = runner.run(planned_run)
-        run_result = run_result.model_copy(update={"system_snapshot": run_system_snapshot})
+        run_result = run_result.model_copy(
+            update={
+                "system_snapshot": run_system_snapshot,
+                "metrics": {
+                    **run_result.metrics,
+                    **prep_metadata,
+                    **_build_prep_eligibility_metadata(
+                        run_result=run_result,
+                        prep_metadata=prep_metadata,
+                    ),
+                },
+            }
+        )
         runs.append(run_result)
         append_run_artifact(session_dir, run=run_result)
         reporter.on_run_finished(run_result, total_runs=len(planned_runs))
@@ -440,17 +832,63 @@ def _build_environment_snapshot(
     plan: BenchmarkSessionPlan,
     available_models: list[str],
     session_timestamp: datetime,
+    client: OllamaClient,
 ) -> dict[str, Any]:
     python_status = detect_python_environment()
     return {
         "session_started_at": session_timestamp.astimezone(timezone.utc).isoformat(),
+        "benchmark_methodology_version": plan.benchmark_methodology_version,
         "python_version": python_status.python_version,
         "in_venv": python_status.in_venv,
         "executable": python_status.executable,
         "ollama_binary_found": detect_ollama_binary(),
         "host": _build_host_metadata(),
+        "accelerator": detect_accelerator_metadata(),
+        "ollama": _build_ollama_metadata(
+            client=client,
+            model_name=plan.model_name,
+            available_models=available_models,
+        ),
         "available_models": available_models,
         "execution_settings": dict(plan.execution_settings),
+    }
+
+
+def _build_ollama_metadata(
+    *,
+    client: OllamaClient,
+    model_name: str,
+    available_models: list[str],
+) -> dict[str, Any]:
+    version_value: str | None = None
+    version_error: str | None = None
+    try:
+        version_value = client.version()
+    except Exception as exc:
+        version_error = str(exc) or exc.__class__.__name__
+
+    show_payload: dict[str, Any] | None = None
+    show_error: str | None = None
+    try:
+        show_payload = client.show_model(model_name)
+    except Exception as exc:
+        show_error = str(exc) or exc.__class__.__name__
+
+    return {
+        "binary_found": detect_ollama_binary(),
+        "version": {
+            "available": version_error is None and version_value is not None,
+            "value": version_value,
+            "error": version_error,
+        },
+        "selected_model": {
+            "name": model_name,
+            "show_available": show_error is None and show_payload is not None,
+            "details": show_payload.get("details") if isinstance(show_payload, dict) else None,
+            "model_info": show_payload.get("model_info") if isinstance(show_payload, dict) else None,
+            "error": show_error,
+        },
+        "available_models": list(available_models),
     }
 
 
@@ -476,15 +914,36 @@ def _response_elapsed_ms(
 
 def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
-    for key in ("prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+    for key in ("load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
         value = response.get(key)
         if isinstance(value, (int, float)):
             metrics[key] = value
 
+    load_duration = response.get("load_duration")
+    if isinstance(load_duration, (int, float)):
+        metrics["load_duration_ms"] = round(float(load_duration) / 1_000_000, 3)
+
+    prompt_eval_count = response.get("prompt_eval_count")
+    prompt_eval_duration = response.get("prompt_eval_duration")
+    if (
+        isinstance(prompt_eval_count, (int, float))
+        and isinstance(prompt_eval_duration, (int, float))
+        and prompt_eval_duration
+    ):
+        metrics["prompt_tokens_per_second"] = round(
+            float(prompt_eval_count) / (float(prompt_eval_duration) / 1_000_000_000),
+            3,
+        )
+
     eval_count = response.get("eval_count")
     eval_duration = response.get("eval_duration")
     if isinstance(eval_count, (int, float)) and isinstance(eval_duration, (int, float)) and eval_duration:
-        metrics["tokens_per_second"] = round(float(eval_count) / (float(eval_duration) / 1_000_000_000), 3)
+        generation_tokens_per_second = round(
+            float(eval_count) / (float(eval_duration) / 1_000_000_000),
+            3,
+        )
+        metrics["generation_tokens_per_second"] = generation_tokens_per_second
+        metrics["tokens_per_second"] = generation_tokens_per_second
 
     return metrics
 

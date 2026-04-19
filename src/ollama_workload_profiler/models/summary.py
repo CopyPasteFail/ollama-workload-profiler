@@ -20,6 +20,7 @@ class ModelSummary(BaseModel):
 class ReportSummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    benchmark_methodology_version: str | None = None
     executive_summary: str = ""
     session_metrics: dict[str, SummaryMetricValue] = Field(default_factory=dict)
     model_summaries: dict[str, ModelSummary] = Field(default_factory=dict)

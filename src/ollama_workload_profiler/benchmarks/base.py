@@ -10,6 +10,7 @@ from ..metrics.sampler import SamplePoint
 from ..models.failures import FailureInfo
 from ..models.plan import BenchmarkType, PlannedRun
 from ..models.results import RunResult, RunState
+from ..execution_settings import normalize_execution_settings
 from ..prompts.scenarios import ScenarioDefinition
 
 
@@ -33,6 +34,14 @@ class ExecutionRequest:
     run: PlannedRun
     scenario: ScenarioDefinition
     execution_mode: ExecutionMode
+    execution_settings: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "execution_settings",
+            normalize_execution_settings(self.execution_settings),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +72,7 @@ class BenchmarkRunner:
         sampler_factory: Callable[[], BenchmarkSampler],
         family_resolver: Callable[[BenchmarkType], BenchmarkFamily] | None = None,
         on_state_change: Callable[[PlannedRun, RunState], None] | None = None,
+        execution_settings: Mapping[str, Any] | None = None,
     ) -> None:
         if family_resolver is None:
             from . import resolve_benchmark_family
@@ -72,6 +82,7 @@ class BenchmarkRunner:
         self._sampler_factory = sampler_factory
         self._family_resolver = family_resolver
         self._on_state_change = on_state_change
+        self._execution_settings = normalize_execution_settings(execution_settings)
 
     def run(self, planned_run: PlannedRun) -> RunResult:
         family = self._family_resolver(planned_run.benchmark_type)
@@ -89,6 +100,7 @@ class BenchmarkRunner:
                     run=planned_run,
                     scenario=scenario,
                     execution_mode=family.execution_mode,
+                    execution_settings=dict(self._execution_settings),
                 )
             )
         except BenchmarkExecutionStopped as exc:

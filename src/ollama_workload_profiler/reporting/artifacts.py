@@ -9,6 +9,8 @@ from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel
 
+from ..methodology import BENCHMARK_METHODOLOGY_VERSION
+
 
 ARTIFACT_FILENAMES = (
     "plan.json",
@@ -32,9 +34,9 @@ def initialize_session_artifacts(
     output_root = _validate_base_dir(base_dir)
     session_dir = _create_session_dir(output_root, session_timestamp=session_timestamp)
 
-    plan_payload = _to_json_payload(plan)
+    plan_payload = _with_methodology_version(_to_json_payload(plan))
     expanded_plan_payload = [_to_json_payload(item) for item in expanded_plan]
-    environment_payload = _to_json_payload(environment)
+    environment_payload = _with_methodology_version(_to_json_payload(environment))
 
     _write_json(session_dir / "plan.json", plan_payload)
     _write_json(session_dir / "expanded_plan.json", expanded_plan_payload)
@@ -131,9 +133,14 @@ def _to_json_payload(value: Mapping[str, Any] | BaseModel) -> dict[str, Any]:
 
 
 def _with_artifact_manifest(summary: Mapping[str, Any] | BaseModel) -> dict[str, Any]:
-    summary_payload = _to_json_payload(summary)
+    summary_payload = _with_methodology_version(_to_json_payload(summary))
     summary_payload["artifacts"] = {name: name for name in ARTIFACT_FILENAMES}
     return summary_payload
+
+
+def _with_methodology_version(payload: dict[str, Any]) -> dict[str, Any]:
+    payload.setdefault("benchmark_methodology_version", BENCHMARK_METHODOLOGY_VERSION)
+    return payload
 
 
 def _write_json(path: Path, payload: Any) -> None:
