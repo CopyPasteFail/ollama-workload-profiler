@@ -105,7 +105,7 @@ The CLI exposes:
 - `--temperature` with default `0.0`
 - `--top-p` optional and unset by default
 - `--repetitions`
-- `--warmup-runs`
+- `--warmup-runs` with default `1`
 - `--no-warmup`
 
 These settings feed `BenchmarkSessionPlan.execution_settings` and are echoed in the benchmark budget output so the user sees the benchmark policy before execution starts.
@@ -167,6 +167,8 @@ Canonical per-run metric fields for this pass are:
 - `tokens_per_second` as a backward-compatible alias of `generation_tokens_per_second`
 - `ttft_first_emission_ms`
 
+Backward-compatibility contract: when `generation_tokens_per_second` is present, `tokens_per_second` must also be present with the same numeric value and no different interpretation. New reports should use `generation_tokens_per_second` as the canonical field name.
+
 `ttft_first_answer_ms` is not required for this pass, but the naming contract should leave room for it as a future addition without redefining the meaning of `ttft_first_emission_ms`.
 
 Per-run response metrics expand to include:
@@ -225,8 +227,8 @@ The cache may live in memory for the session; persistent cross-session caching i
 
 Calibration must not run indefinitely. The design uses:
 
-- a fixed maximum attempt count in the range of 3 to 5 tries
-- a tolerance such as plus or minus five percent
+- a fixed maximum attempt count of `4`
+- a tolerance of plus or minus `5%`
 - explicit fallback recording when calibration does not converge
 - `calibration_status` values of `exact`, `approximate`, or `failed`
 
@@ -263,6 +265,20 @@ Accelerator, VRAM, and some model or runtime metadata are best-effort and may be
 Aggregate summaries should reflect completed runs only and include sample size.
 
 Headline benchmark aggregates should use completed runs with successful preparation or explicitly accepted approximate preparation. Runs with failed enforcement remain in raw artifacts but are excluded from strict benchmark aggregates unless a report section explicitly says it is using inclusive counts.
+
+Per-run eligibility flags should use these exact field names:
+
+- `eligible_for_strict_aggregate`
+- `eligible_for_cold_start_aggregate`
+- `eligible_for_ttft_aggregate`
+- `eligible_for_calibrated_context_aggregate`
+
+Eligibility rules:
+
+- `eligible_for_strict_aggregate` is `true` only for completed runs whose required preparation was successfully enforced or whose calibration status is explicitly accepted as `approximate`
+- `eligible_for_cold_start_aggregate` is `true` only for completed cold-start runs with successful cold enforcement
+- `eligible_for_ttft_aggregate` is `true` only for completed TTFT runs with a recorded `ttft_first_emission_ms`
+- `eligible_for_calibrated_context_aggregate` is `true` only for completed context-fill runs with `calibration_status` of `exact` or `approximate`
 
 ### Session and benchmark summaries
 
