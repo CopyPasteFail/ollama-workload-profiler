@@ -16,7 +16,7 @@ from typing import Any
 
 import psutil
 
-from .benchmarks import build_scenarios_for_benchmark
+from .benchmarks import build_scenarios_for_benchmark, resolve_benchmark_family
 from .benchmarks.base import BenchmarkRunner, ExecutionMode, ExecutionRequest, ExecutionResult
 from .env_check import detect_ollama_binary, detect_python_environment
 from .metrics.process import find_ollama_processes
@@ -242,9 +242,205 @@ class ProfileSessionResult:
     summary: ReportSummary
 
 
+def _build_execution_options(
+    *,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    execution_mode: ExecutionMode,
+) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "num_ctx": planned_run.context_size,
+        "num_predict": scenario.target_output_tokens,
+        "seed": execution_settings["seed"],
+        "temperature": execution_settings["temperature"],
+    }
+
+    top_p = execution_settings.get("top_p")
+    if top_p is not None:
+        options["top_p"] = top_p
+
+    if execution_mode is ExecutionMode.TTFT:
+        # Some Ollama models collapse `num_predict=1` into a terminal metadata
+        # chunk with no observable streamed token, so TTFT uses a small floor.
+        options["num_predict"] = max(8, scenario.target_output_tokens)
+
+    return options
+
+
+def _resolve_planned_scenario(planned_run: PlannedRun) -> ScenarioDefinition:
+    for scenario in _build_scenarios_for_benchmark(planned_run.benchmark_type, planned_run.context_size):
+        if scenario.scenario_id == planned_run.scenario_id:
+            return scenario
+    raise ValueError(
+        f"Unknown scenario {planned_run.scenario_id!r} for benchmark "
+        f"{planned_run.benchmark_type.value}"
+    )
+
+
+def _warmup_runs_requested(execution_settings: Mapping[str, Any]) -> int:
+    warmup_runs = execution_settings.get("warmup_runs", 1)
+    if isinstance(warmup_runs, bool) or not isinstance(warmup_runs, int) or warmup_runs < 1:
+        raise ValueError("execution_settings.warmup_runs must be a positive integer")
+    return warmup_runs
+
+
+def _warmup_context_boundary(
+    *,
+    client: OllamaClient,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    execution_mode: ExecutionMode,
+) -> bool:
+    options = _build_execution_options(
+        planned_run=planned_run,
+        scenario=scenario,
+        execution_settings=execution_settings,
+        execution_mode=execution_mode,
+    )
+
+    prompt_payload = scenario.prompt_payload
+    if isinstance(prompt_payload, MultiTurnChatPromptPayload):
+        client.chat(
+            model=planned_run.model_name,
+            messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
+            options=options,
+        )
+    else:
+        client.generate(
+            model=planned_run.model_name,
+            prompt=prompt_payload.text,
+            options=options,
+        )
+    return True
+
+
+def _prepare_run_preference(
+    *,
+    client: OllamaClient,
+    planned_run: PlannedRun,
+    scenario: ScenarioDefinition,
+    execution_settings: Mapping[str, Any],
+    warmed_contexts: set[tuple[str, int]],
+) -> dict[str, Any]:
+    boundary_key = (planned_run.model_name, planned_run.context_size)
+    execution_mode = resolve_benchmark_family(planned_run.benchmark_type).execution_mode
+    warmup_enabled = execution_settings.get("warmup_enabled", True)
+
+    if planned_run.benchmark_type is BenchmarkType.COLD_WARM and scenario.profile_tag == "cold_start":
+        try:
+            client.unload_model(model=planned_run.model_name)
+            return {
+                "requested_prep_behavior": "cold_start",
+                "actual_prep_method": "explicit_unload",
+                "prep_enforcement_succeeded": True,
+            }
+        except Exception:
+            return {
+                "requested_prep_behavior": "cold_start",
+                "actual_prep_method": "explicit_unload_failed",
+                "prep_enforcement_succeeded": False,
+            }
+
+    if planned_run.benchmark_type is BenchmarkType.COLD_WARM and scenario.profile_tag == "warm_start":
+        try:
+            client.preload_model(
+                model=planned_run.model_name,
+                options=_build_execution_options(
+                    planned_run=planned_run,
+                    scenario=scenario,
+                    execution_settings=execution_settings,
+                    execution_mode=execution_mode,
+                ),
+            )
+            return {
+                "requested_prep_behavior": "warm_start",
+                "actual_prep_method": "explicit_preload",
+                "prep_enforcement_succeeded": True,
+            }
+        except Exception:
+            return {
+                "requested_prep_behavior": "warm_start",
+                "actual_prep_method": "explicit_preload_failed",
+                "prep_enforcement_succeeded": False,
+            }
+
+    if boundary_key in warmed_contexts:
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "already_warm",
+            "prep_enforcement_succeeded": True,
+        }
+
+    if not warmup_enabled:
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "warmup_disabled",
+            "prep_enforcement_succeeded": False,
+        }
+
+    warmup_method = "chat" if isinstance(scenario.prompt_payload, MultiTurnChatPromptPayload) else "generate"
+    if not hasattr(client, warmup_method):
+        return {
+            "requested_prep_behavior": "session_warmup",
+            "actual_prep_method": "warmup_unavailable",
+            "prep_enforcement_succeeded": False,
+        }
+
+    warmup_runs = _warmup_runs_requested(execution_settings)
+    warmup_success = True
+    for _ in range(warmup_runs):
+        try:
+            _warmup_context_boundary(
+                client=client,
+                planned_run=planned_run,
+                scenario=scenario,
+                execution_settings=execution_settings,
+                execution_mode=execution_mode,
+            )
+        except Exception:
+            warmup_success = False
+            break
+
+    if warmup_success:
+        warmed_contexts.add(boundary_key)
+    return {
+        "requested_prep_behavior": "session_warmup",
+        "actual_prep_method": "session_warmup" if warmup_success else "session_warmup_failed",
+        "prep_enforcement_succeeded": warmup_success,
+        }
+
+
+def _build_prep_eligibility_metadata(
+    *,
+    run_result: RunResult,
+    prep_metadata: Mapping[str, Any],
+) -> dict[str, Any]:
+    prep_succeeded = bool(prep_metadata.get("prep_enforcement_succeeded"))
+    requested_behavior = prep_metadata.get("requested_prep_behavior")
+    completed = run_result.state is RunState.COMPLETED
+
+    metadata: dict[str, Any] = {
+        "eligible_for_strict_aggregate": completed and prep_succeeded,
+        "eligible_for_cold_start_aggregate": bool(
+            completed and prep_succeeded and requested_behavior == "cold_start"
+        ),
+    }
+    return metadata
+
+
 class _OllamaDispatcher:
     def __init__(self, client: OllamaClient) -> None:
         self._client = client
+
+    def _build_options(self, request: ExecutionRequest) -> dict[str, Any]:
+        return _build_execution_options(
+            planned_run=request.run,
+            scenario=request.scenario,
+            execution_settings=request.execution_settings,
+            execution_mode=request.execution_mode,
+        )
 
     def execute(self, request: ExecutionRequest) -> ExecutionResult:
         prompt_payload = request.scenario.prompt_payload
@@ -261,40 +457,28 @@ class _OllamaDispatcher:
             metrics.update(stream_metrics)
             return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
 
+        options = _build_execution_options(
+            planned_run=request.run,
+            scenario=request.scenario,
+            execution_settings=request.execution_settings,
+            execution_mode=request.execution_mode,
+        )
         if isinstance(prompt_payload, MultiTurnChatPromptPayload):
             response = self._client.chat(
                 model=request.run.model_name,
                 messages=[{"role": "user", "content": turn} for turn in prompt_payload.turns],
-                options=self._build_options(request),
+                options=options,
             )
         else:
             response = self._client.generate(
                 model=request.run.model_name,
                 prompt=prompt_payload.text,
-                options=self._build_options(request),
+                options=options,
             )
 
         elapsed_ms = _response_elapsed_ms(response, started_at)
         metrics = _response_metrics(response)
         return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
-
-    def _build_options(self, request: ExecutionRequest) -> dict[str, Any]:
-        options: dict[str, Any] = {
-            "num_ctx": request.run.context_size,
-            "num_predict": request.scenario.target_output_tokens,
-        }
-        options["seed"] = request.execution_settings["seed"]
-        options["temperature"] = request.execution_settings["temperature"]
-
-        top_p = request.execution_settings.get("top_p")
-        if top_p is not None:
-            options["top_p"] = top_p
-
-        if request.execution_mode is ExecutionMode.TTFT:
-            # Some Ollama models collapse `num_predict=1` into a terminal metadata
-            # chunk with no observable streamed token, so TTFT uses a small floor.
-            options["num_predict"] = max(8, request.scenario.target_output_tokens)
-        return options
 
     def _execute_ttft_stream(
         self,
@@ -422,11 +606,32 @@ def run_profile_session(
 
     runs: list[RunResult] = []
     reporter = progress_reporter or ProgressReporter()
+    warmed_contexts: set[tuple[str, int]] = set()
     for planned_run in planned_runs:
         reporter.on_run_started(planned_run, total_runs=len(planned_runs))
+        scenario = _resolve_planned_scenario(planned_run)
+        prep_metadata = _prepare_run_preference(
+            client=client,
+            planned_run=planned_run,
+            scenario=scenario,
+            execution_settings=plan.execution_settings,
+            warmed_contexts=warmed_contexts,
+        )
         run_system_snapshot = _build_run_system_snapshot()
         run_result = runner.run(planned_run)
-        run_result = run_result.model_copy(update={"system_snapshot": run_system_snapshot})
+        run_result = run_result.model_copy(
+            update={
+                "system_snapshot": run_system_snapshot,
+                "metrics": {
+                    **run_result.metrics,
+                    **prep_metadata,
+                    **_build_prep_eligibility_metadata(
+                        run_result=run_result,
+                        prep_metadata=prep_metadata,
+                    ),
+                },
+            }
+        )
         runs.append(run_result)
         append_run_artifact(session_dir, run=run_result)
         reporter.on_run_finished(run_result, total_runs=len(planned_runs))

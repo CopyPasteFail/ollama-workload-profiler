@@ -113,6 +113,47 @@ def test_stream_chat_sends_streaming_payload_and_yields_chunks() -> None:
     ]
 
 
+def test_unload_model_requests_keep_alive_zero() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/generate"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(200, json={"done": True, "done_reason": "unload"}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.unload_model(model="llama3.2") == {"done": True, "done_reason": "unload"}
+    assert seen_payload == {"model": "llama3.2", "keep_alive": 0}
+
+
+def test_preload_model_requests_keep_alive_negative_one() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/generate"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(200, json={"done": True}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.preload_model(
+        model="llama3.2",
+        options={"num_ctx": 4096, "seed": 42, "temperature": 0.0},
+    ) == {"done": True}
+    assert seen_payload == {
+        "model": "llama3.2",
+        "keep_alive": -1,
+        "prompt": "",
+        "stream": False,
+        "options": {"num_ctx": 4096, "seed": 42, "temperature": 0.0},
+    }
+
+
 def test_client_accepts_timeout_and_passes_it_to_httpx_client(monkeypatch) -> None:
     created_kwargs: dict[str, object] = {}
 

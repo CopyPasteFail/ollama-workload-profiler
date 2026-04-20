@@ -115,6 +115,32 @@ class OllamaClient:
             stream=True,
         )
 
+    def unload_model(self, *, model: str) -> dict[str, Any]:
+        response = self._client.post(
+            "/api/generate",
+            json={"model": model, "keep_alive": 0},
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def preload_model(
+        self,
+        *,
+        model: str,
+        options: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "keep_alive": -1,
+            "prompt": "",
+            "stream": False,
+        }
+        if options:
+            payload["options"] = dict(options)
+        response = self._client.post("/api/generate", json=payload)
+        response.raise_for_status()
+        return response.json()
+
     def _build_generate_payload(
         self,
         *,
