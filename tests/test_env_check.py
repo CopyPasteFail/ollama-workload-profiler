@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from ollama_workload_profiler import cli
 from ollama_workload_profiler.env_check import (
+    detect_accelerator_metadata,
     PythonEnvironmentStatus,
     detect_dependency_status,
     detect_python_environment,
@@ -78,6 +79,48 @@ def test_probe_ollama_server_returns_models(monkeypatch) -> None:
 
     assert reachable is True
     assert models == ["llama3.2:latest"]
+
+
+def test_detect_accelerator_metadata_prefers_nvidia_smi_when_available(monkeypatch) -> None:
+    class FakeCompletedProcess:
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    monkeypatch.setattr("shutil.which", lambda command: "nvidia-smi" if command == "nvidia-smi" else None)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: FakeCompletedProcess(
+            "NVIDIA RTX 4090, 24564, 535.146.02\nNVIDIA RTX 4090, 24564, 535.146.02\n"
+        ),
+    )
+
+    metadata = detect_accelerator_metadata()
+
+    assert metadata["kind"] == "nvidia"
+    assert metadata["detection_source"] == "nvidia-smi"
+    assert metadata["available"] is True
+    assert metadata["device_count"] == 2
+    assert metadata["devices"][0]["name"] == "NVIDIA RTX 4090"
+    assert metadata["devices"][0]["memory_total_mb"] == 24564
+    assert metadata["driver_version"] == "535.146.02"
+
+
+def test_detect_accelerator_metadata_reports_unknown_when_no_tooling_or_platform_hint(monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+
+    metadata = detect_accelerator_metadata()
+
+    assert metadata == {
+        "kind": "unknown",
+        "detection_source": "heuristic",
+        "available": False,
+        "device_count": 0,
+        "devices": [],
+        "status": "undetected",
+        "notes": ["No supported accelerator tooling detected; host is likely CPU-only."],
+    }
 
 
 def test_doctor_command_prints_status_and_uses_exit_code(monkeypatch) -> None:

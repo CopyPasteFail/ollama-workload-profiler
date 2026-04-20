@@ -24,6 +24,41 @@ def test_list_models_returns_model_names() -> None:
     assert client.list_models() == ["llama3.2:latest", "mistral:7b"]
 
 
+def test_version_returns_string_from_api_version() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/version"
+        return httpx.Response(200, json={"version": "0.6.0"}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.version() == "0.6.0"
+
+
+def test_show_model_posts_name_to_api_show() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/show"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"details": {"family": "llama"}, "model_info": {"general.architecture": "llama"}},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.show_model("llama3.2:latest") == {
+        "details": {"family": "llama"},
+        "model_info": {"general.architecture": "llama"},
+    }
+    assert seen_payload == {"name": "llama3.2:latest"}
+
+
 def test_generate_defaults_to_non_streaming_requests() -> None:
     seen_payload: dict[str, object] = {}
 

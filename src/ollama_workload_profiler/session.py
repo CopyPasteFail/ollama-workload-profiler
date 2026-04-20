@@ -18,7 +18,11 @@ import psutil
 
 from .benchmarks import build_scenarios_for_benchmark, resolve_benchmark_family
 from .benchmarks.base import BenchmarkRunner, ExecutionMode, ExecutionRequest, ExecutionResult
-from .env_check import detect_ollama_binary, detect_python_environment
+from .env_check import (
+    detect_accelerator_metadata,
+    detect_ollama_binary,
+    detect_python_environment,
+)
 from .metrics.process import find_ollama_processes
 from .metrics.sampler import PollingProcessSampler
 from .models.plan import BenchmarkSessionPlan, BenchmarkType, PlannedRun
@@ -762,6 +766,7 @@ def run_profile_session(
         plan=plan,
         available_models=available_models if available_models is not None else client.list_models(),
         session_timestamp=timestamp,
+        client=client,
     )
     session_dir = initialize_session_artifacts(
         session_root,
@@ -827,6 +832,7 @@ def _build_environment_snapshot(
     plan: BenchmarkSessionPlan,
     available_models: list[str],
     session_timestamp: datetime,
+    client: OllamaClient,
 ) -> dict[str, Any]:
     python_status = detect_python_environment()
     return {
@@ -836,8 +842,52 @@ def _build_environment_snapshot(
         "executable": python_status.executable,
         "ollama_binary_found": detect_ollama_binary(),
         "host": _build_host_metadata(),
+        "accelerator": detect_accelerator_metadata(),
+        "ollama": _build_ollama_metadata(
+            client=client,
+            model_name=plan.model_name,
+            available_models=available_models,
+        ),
         "available_models": available_models,
         "execution_settings": dict(plan.execution_settings),
+    }
+
+
+def _build_ollama_metadata(
+    *,
+    client: OllamaClient,
+    model_name: str,
+    available_models: list[str],
+) -> dict[str, Any]:
+    version_value: str | None = None
+    version_error: str | None = None
+    try:
+        version_value = client.version()
+    except Exception as exc:
+        version_error = str(exc) or exc.__class__.__name__
+
+    show_payload: dict[str, Any] | None = None
+    show_error: str | None = None
+    try:
+        show_payload = client.show_model(model_name)
+    except Exception as exc:
+        show_error = str(exc) or exc.__class__.__name__
+
+    return {
+        "binary_found": detect_ollama_binary(),
+        "version": {
+            "available": version_error is None and version_value is not None,
+            "value": version_value,
+            "error": version_error,
+        },
+        "selected_model": {
+            "name": model_name,
+            "show_available": show_error is None and show_payload is not None,
+            "details": show_payload.get("details") if isinstance(show_payload, dict) else None,
+            "model_info": show_payload.get("model_info") if isinstance(show_payload, dict) else None,
+            "error": show_error,
+        },
+        "available_models": list(available_models),
     }
 
 

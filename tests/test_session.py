@@ -402,6 +402,184 @@ def test_run_profile_session_persists_requested_policy_in_environment_artifact(
     assert "benchmark_types" not in environment_payload
 
 
+def test_run_profile_session_persists_accelerator_and_ollama_metadata_in_environment_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2:latest",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        repetitions=1,
+    )
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def version(self) -> str:
+            return "0.6.0"
+
+        def show_model(self, model_name: str) -> dict[str, object]:
+            assert model_name == plan.model_name
+            return {
+                "details": {"family": "llama", "parameter_size": "8B"},
+                "model_info": {"general.architecture": "llama"},
+            }
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session.detect_accelerator_metadata",
+        lambda: {
+            "kind": "nvidia",
+            "detection_source": "nvidia-smi",
+            "available": True,
+            "device_count": 1,
+            "devices": [{"name": "RTX 4090", "memory_total_mb": 24564}],
+            "status": "detected",
+            "notes": [],
+        },
+    )
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 20, 0, tzinfo=timezone.utc),
+    )
+
+    environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
+    assert environment_payload["accelerator"] == {
+        "kind": "nvidia",
+        "detection_source": "nvidia-smi",
+        "available": True,
+        "device_count": 1,
+        "devices": [{"name": "RTX 4090", "memory_total_mb": 24564}],
+        "status": "detected",
+        "notes": [],
+    }
+    assert environment_payload["ollama"] == {
+        "binary_found": True,
+        "version": {"available": True, "value": "0.6.0", "error": None},
+        "selected_model": {
+            "name": "llama3.2:latest",
+            "show_available": True,
+            "details": {"family": "llama", "parameter_size": "8B"},
+            "model_info": {"general.architecture": "llama"},
+            "error": None,
+        },
+        "available_models": ["llama3.2:latest"],
+    }
+
+
+def test_run_profile_session_records_missing_ollama_metadata_honestly_when_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2:latest",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.SMOKE],
+        repetitions=1,
+    )
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return []
+
+        def version(self) -> str:
+            raise RuntimeError("version endpoint unavailable")
+
+        def show_model(self, model_name: str) -> dict[str, object]:
+            raise RuntimeError(f"show unavailable for {model_name}")
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr("ollama_workload_profiler.session.detect_ollama_binary", lambda: False)
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session.detect_accelerator_metadata",
+        lambda: {
+            "kind": "unknown",
+            "detection_source": "heuristic",
+            "available": False,
+            "device_count": 0,
+            "devices": [],
+            "status": "undetected",
+            "notes": ["No supported accelerator tooling detected; host is likely CPU-only."],
+        },
+    )
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 19, 10, 25, 0, tzinfo=timezone.utc),
+    )
+
+    environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
+    assert environment_payload["ollama"] == {
+        "binary_found": False,
+        "version": {
+            "available": False,
+            "value": None,
+            "error": "version endpoint unavailable",
+        },
+        "selected_model": {
+            "name": "llama3.2:latest",
+            "show_available": False,
+            "details": None,
+            "model_info": None,
+            "error": "show unavailable for llama3.2:latest",
+        },
+        "available_models": [],
+    }
+
+
 def test_requested_repetitions_raises_for_malformed_policy_value() -> None:
     plan = BenchmarkSessionPlan.model_construct(
         model_name="llama3.2",

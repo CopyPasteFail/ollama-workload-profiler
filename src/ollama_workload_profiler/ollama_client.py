@@ -43,6 +43,23 @@ class OllamaClient:
         payload = response.json()
         return [model["name"] for model in payload.get("models", [])]
 
+    def version(self) -> str:
+        response = self._client.get("/api/version")
+        response.raise_for_status()
+        payload = response.json()
+        version = payload.get("version")
+        if not isinstance(version, str):
+            raise ValueError("Ollama version response did not include a string version")
+        return version
+
+    def show_model(self, model_name: str) -> dict[str, Any]:
+        response = self._client.post("/api/show", json={"name": model_name})
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Ollama show response was not a JSON object")
+        return payload
+
     def generate(
         self,
         *,
