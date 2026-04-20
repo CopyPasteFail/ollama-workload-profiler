@@ -580,6 +580,125 @@ def test_run_profile_session_records_missing_ollama_metadata_honestly_when_unava
     }
 
 
+def test_run_profile_session_artifacts_keep_p0_summary_contract_consistent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = build_profile_session_plan(
+        model_name="llama3.2:latest",
+        contexts=[4096, 8192],
+        benchmark_types=[BenchmarkType.COLD_WARM],
+        repetitions=1,
+    )
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            self._calls = 0
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            self._calls += 1
+            is_cold = "cold-start" in planned_run.scenario_id
+            metrics = {
+                "load_duration_ms": 120.0 if is_cold else 5.0,
+                "prompt_tokens_per_second": 1500.0 + self._calls,
+                "generation_tokens_per_second": 30.0 + self._calls,
+                "tokens_per_second": 30.0 + self._calls,
+                "eligible_for_strict_aggregate": not is_cold,
+                "eligible_for_cold_start_aggregate": is_cold,
+            }
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=50.0 + self._calls,
+                metrics=metrics,
+            )
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.unload_calls: list[str] = []
+            self.preload_calls: list[str] = []
+
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def unload_model(self, *, model: str) -> dict[str, object]:
+            self.unload_calls.append(model)
+            return {"done": True}
+
+        def preload_model(self, *, model: str, options: dict[str, object] | None = None) -> dict[str, object]:
+            self.preload_calls.append(model)
+            return {"done": True}
+
+        def version(self) -> str:
+            return "0.6.0"
+
+        def show_model(self, model_name: str) -> dict[str, object]:
+            return {"details": {"family": "llama"}, "model_info": {"general.architecture": "llama"}}
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session.detect_accelerator_metadata",
+        lambda: {
+            "kind": "unknown",
+            "detection_source": "heuristic",
+            "available": False,
+            "device_count": 0,
+            "devices": [],
+            "status": "undetected",
+            "notes": ["No supported accelerator tooling detected; host is likely CPU-only."],
+        },
+    )
+
+    client = FakeClient()
+    result = run_profile_session(
+        plan=plan,
+        client=client,
+        output_dir=tmp_path,
+        session_timestamp=datetime(2026, 4, 20, 9, 0, 0, tzinfo=timezone.utc),
+    )
+
+    plan_payload = json.loads((result.session_dir / "plan.json").read_text(encoding="utf-8"))
+    environment_payload = json.loads((result.session_dir / "environment.json").read_text(encoding="utf-8"))
+    raw_rows = [
+        json.loads(line)
+        for line in (result.session_dir / "raw.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    summary_payload = json.loads((result.session_dir / "summary.json").read_text(encoding="utf-8"))
+    report_markdown = (result.session_dir / "report.md").read_text(encoding="utf-8")
+
+    assert plan_payload["execution_settings"]["repetitions"] == 1
+    assert environment_payload["execution_settings"]["repetitions"] == 1
+    assert environment_payload["execution_settings"]["seed"] == 42
+    assert environment_payload["execution_settings"]["temperature"] == 0.0
+    assert environment_payload["ollama"]["version"]["value"] == "0.6.0"
+    assert len(raw_rows) == 4
+    assert any(row["metrics"]["requested_prep_behavior"] == "cold_start" for row in raw_rows)
+    assert any(row["metrics"]["requested_prep_behavior"] == "warm_start" for row in raw_rows)
+    assert all(row["metrics"]["eligible_for_strict_aggregate"] is True for row in raw_rows)
+    assert sum(
+        1 for row in raw_rows if row["metrics"]["eligible_for_cold_start_aggregate"] is True
+    ) == 2
+    assert summary_payload["session_metrics"]["generation_tokens_per_second_sample_size"] == 4
+    assert all("strict_sample_size" in row for row in summary_payload["benchmark_summaries"])
+    assert "generation_tokens_per_second" in report_markdown
+    assert "n=" in report_markdown
+    assert "\n- tokens_per_second:" not in report_markdown
+    assert "| tokens_per_second |" not in report_markdown
+    assert client.unload_calls == [plan.model_name, plan.model_name]
+    assert client.preload_calls == [plan.model_name, plan.model_name]
+
+
 def test_requested_repetitions_raises_for_malformed_policy_value() -> None:
     plan = BenchmarkSessionPlan.model_construct(
         model_name="llama3.2",
@@ -3259,3 +3378,145 @@ def test_run_profile_session_marks_failed_enforced_cold_sample_ineligible(
     assert cold_run.metrics["prep_enforcement_succeeded"] is False
     assert cold_run.metrics["eligible_for_strict_aggregate"] is False
     assert cold_run.metrics["eligible_for_cold_start_aggregate"] is False
+
+
+def test_run_profile_session_warms_multi_turn_chat_once_per_context_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096, 8192],
+        benchmark_types=[BenchmarkType.USE_CASE_PROFILES],
+        execution_settings={
+            "repetitions": 1,
+            "warmup_runs": 1,
+            "warmup_enabled": True,
+        },
+    )
+    scenarios_4096 = build_benchmark_scenarios(BenchmarkType.USE_CASE_PROFILES, 4096)
+    scenarios_8192 = build_benchmark_scenarios(BenchmarkType.USE_CASE_PROFILES, 8192)
+    chat_4096 = next(
+        scenario for scenario in scenarios_4096 if scenario.scenario_id == "use-case-profiles-multi-turn-chat-v1"
+    )
+    chat_8192 = next(
+        scenario for scenario in scenarios_8192 if scenario.scenario_id == "use-case-profiles-multi-turn-chat-v1"
+    )
+    expanded_plan = [
+        PlannedRun(
+            run_id="run-chat-4096",
+            run_index=1,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.USE_CASE_PROFILES,
+            benchmark_type_index=1,
+            scenario_id=chat_4096.scenario_id,
+            scenario_index=3,
+            repetition_index=1,
+            scenario_name=chat_4096.name,
+            scenario_version=chat_4096.version,
+        ),
+        PlannedRun(
+            run_id="run-chat-8192",
+            run_index=2,
+            model_name=plan.model_name,
+            context_size=8192,
+            context_index=2,
+            benchmark_type=BenchmarkType.USE_CASE_PROFILES,
+            benchmark_type_index=1,
+            scenario_id=chat_8192.scenario_id,
+            scenario_index=3,
+            repetition_index=1,
+            scenario_name=chat_8192.name,
+            scenario_version=chat_8192.version,
+        ),
+    ]
+    call_log: list[str] = []
+
+    class FakeRunner:
+        def __init__(self, **_: object) -> None:
+            return None
+
+        def run(self, planned_run: PlannedRun) -> RunResult:
+            call_log.append(f"run:{planned_run.context_size}")
+            return RunResult(
+                run_id=planned_run.run_id,
+                run_index=planned_run.run_index,
+                model_name=planned_run.model_name,
+                context_size=planned_run.context_size,
+                context_index=planned_run.context_index,
+                benchmark_type=planned_run.benchmark_type,
+                benchmark_type_index=planned_run.benchmark_type_index,
+                scenario_id=planned_run.scenario_id,
+                scenario_index=planned_run.scenario_index,
+                scenario_version=planned_run.scenario_version,
+                repetition_index=planned_run.repetition_index,
+                scenario_name=planned_run.scenario_name,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={"tokens_per_second": 5.0},
+            )
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def chat(self, *, model: str, messages: list[dict[str, object]], options: dict[str, object]) -> dict[str, object]:
+            assert model == plan.model_name
+            call_log.append(f"warmup-chat:{options['num_ctx']}")
+            assert [message["content"] for message in messages] == list(MULTI_TURN_CHAT_TURNS)
+            return {
+                "message": {"content": "ok"},
+                "total_duration": 1_000_000,
+                "prompt_eval_count": 1,
+                "prompt_eval_duration": 1_000_000,
+                "eval_count": 1,
+                "eval_duration": 1_000_000,
+            }
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            raise AssertionError("multi-turn warmup should use chat, not generate")
+
+    monkeypatch.setattr("ollama_workload_profiler.session.BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session._build_host_metadata",
+        lambda: {
+            "hostname": "bench-host",
+            "os": {"platform": "test-os", "release": "1.0"},
+            "cpu": {"logical_cores": 16, "physical_cores": 8},
+            "memory": {"total_mb": 32768.0},
+        },
+    )
+    monkeypatch.setattr(
+        "ollama_workload_profiler.session._build_run_system_snapshot",
+        lambda: {
+            "cpu_percent": 21.5,
+            "memory_available_mb": 24000.0,
+            "memory_used_percent": 26.8,
+            "ollama_process_count": 2,
+        },
+    )
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        expanded_plan=expanded_plan,
+        session_timestamp=datetime(2026, 4, 19, 13, 5, 0, tzinfo=timezone.utc),
+    )
+
+    assert call_log == [
+        "warmup-chat:4096",
+        "run:4096",
+        "warmup-chat:8192",
+        "run:8192",
+    ]
+    assert [run.metrics["requested_prep_behavior"] for run in result.runs] == [
+        "session_warmup",
+        "session_warmup",
+    ]
+    assert [run.metrics["actual_prep_method"] for run in result.runs] == [
+        "session_warmup",
+        "session_warmup",
+    ]
