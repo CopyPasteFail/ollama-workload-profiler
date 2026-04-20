@@ -35,6 +35,8 @@ class ScenarioDefinition:
     version: str
     prompt_payload: PromptPayload
     target_output_tokens: int
+    prompt_template_version: str | None = None
+    target_prompt_tokens: int | None = None
     profile_tag: str | None = None
     fill_ratio: float | None = None
     difficulty_tag: str | None = None
@@ -106,10 +108,10 @@ def _build_context_scaling_scenarios(
             benchmark_type=benchmark_type,
             name="Low fill context",
             version="v1",
-            prompt_payload=TextPromptPayload(
-                _context_fill_prompt(context_size, 0.25)
-            ),
+            prompt_payload=TextPromptPayload(PROMPT_SCALING_BASE_TEXT),
             target_output_tokens=64,
+            prompt_template_version="v1",
+            target_prompt_tokens=max(1, int(context_size * 0.25)),
             fill_ratio=0.25,
             difficulty_tag="light",
             phase_emphasis="load_sensitive",
@@ -119,10 +121,10 @@ def _build_context_scaling_scenarios(
             benchmark_type=benchmark_type,
             name="Medium fill context",
             version="v1",
-            prompt_payload=TextPromptPayload(
-                _context_fill_prompt(context_size, 0.5)
-            ),
+            prompt_payload=TextPromptPayload(PROMPT_SCALING_BASE_TEXT),
             target_output_tokens=64,
+            prompt_template_version="v1",
+            target_prompt_tokens=max(1, int(context_size * 0.5)),
             fill_ratio=0.5,
             difficulty_tag="medium",
             phase_emphasis="load_sensitive",
@@ -132,10 +134,10 @@ def _build_context_scaling_scenarios(
             benchmark_type=benchmark_type,
             name="High fill context",
             version="v1",
-            prompt_payload=TextPromptPayload(
-                _context_fill_prompt(context_size, 0.8)
-            ),
+            prompt_payload=TextPromptPayload(PROMPT_SCALING_BASE_TEXT),
             target_output_tokens=64,
+            prompt_template_version="v1",
+            target_prompt_tokens=max(1, int(context_size * 0.8)),
             fill_ratio=0.8,
             difficulty_tag="heavy",
             phase_emphasis="load_sensitive",
@@ -221,11 +223,6 @@ def _build_use_case_profile_scenarios(
             phase_emphasis="generation_sensitive",
         ),
     ]
-
-
-def _context_fill_prompt(context_size: int, fill_ratio: float) -> str:
-    target_length = max(1, int(context_size * fill_ratio))
-    return _repeat_to_length(PROMPT_SCALING_BASE_TEXT, target_length)
 
 
 def _repeat_to_length(text: str, target_length: int) -> str:

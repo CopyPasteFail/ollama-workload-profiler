@@ -27,6 +27,7 @@ from ollama_workload_profiler.metrics.sampler import PollingProcessSampler, Samp
 from ollama_workload_profiler.metrics.phases import compute_phase_peaks
 from ollama_workload_profiler.prompts.fixtures import (
     MULTI_TURN_CHAT_TURNS,
+    PROMPT_SCALING_BASE_TEXT,
     STATIC_CODE_SAMPLE,
     STATIC_SUMMARY_TEXT,
 )
@@ -1182,6 +1183,17 @@ def test_output_scaling_long_scenario_uses_release_target_band() -> None:
     long_scenario = next(scenario for scenario in scenarios if scenario.scenario_id == "output-scaling-long-v1")
 
     assert long_scenario.target_output_tokens == 768
+
+
+def test_context_scaling_scenarios_declare_calibration_metadata() -> None:
+    scenarios = build_scenarios_for_benchmark(BenchmarkType.CONTEXT_SCALING, 4096)
+
+    assert [scenario.prompt_template_version for scenario in scenarios] == ["v1", "v1", "v1"]
+    assert [scenario.target_prompt_tokens for scenario in scenarios] == [1024, 2048, 3276]
+    assert all(
+        scenario.prompt_payload == TextPromptPayload(PROMPT_SCALING_BASE_TEXT)
+        for scenario in scenarios
+    )
 
 
 def test_cold_warm_family_declares_requested_prep_behavior() -> None:
@@ -2392,6 +2404,280 @@ def test_run_profile_session_enforces_cold_and_warm_prep_before_measured_runs(
     assert result.runs[1].metrics["requested_prep_behavior"] == "warm_start"
     assert result.runs[1].metrics["actual_prep_method"] == "explicit_preload"
     assert result.runs[1].metrics["prep_enforcement_succeeded"] is True
+
+
+def test_context_scaling_runs_record_requested_and_actual_prompt_tokens(
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.CONTEXT_SCALING],
+        execution_settings={
+            "repetitions": 1,
+            "warmup_runs": 1,
+            "warmup_enabled": False,
+        },
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONTEXT_SCALING, 4096)[0]
+    expanded_plan = [
+        PlannedRun(
+            run_id="run-context-calibration",
+            run_index=1,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONTEXT_SCALING,
+            benchmark_type_index=1,
+            scenario_id=scenario.scenario_id,
+            scenario_index=1,
+            repetition_index=1,
+            scenario_name=scenario.name,
+            scenario_version=scenario.version,
+        )
+    ]
+    call_log: list[int] = []
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            call_log.append(int(options["num_predict"]))
+            return {
+                "response": "ok",
+                "total_duration": 1_000_000,
+                "prompt_eval_count": 1024,
+                "prompt_eval_duration": 1_000_000_000,
+                "eval_count": 4,
+                "eval_duration": 500_000_000,
+            }
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        expanded_plan=expanded_plan,
+        session_timestamp=datetime(2026, 4, 19, 13, 15, 0, tzinfo=timezone.utc),
+    )
+
+    calibrated_run = result.runs[0]
+    assert call_log == [1, 64]
+    assert calibrated_run.metrics["requested_fill_ratio"] == 0.25
+    assert calibrated_run.metrics["target_prompt_tokens"] == 1024
+    assert calibrated_run.metrics["actual_prompt_tokens"] == 1024
+    assert calibrated_run.metrics["calibration_status"] == "exact"
+    assert calibrated_run.metrics["calibration_attempts"] == 1
+    assert calibrated_run.metrics["calibration_cache_hit"] is False
+    assert calibrated_run.metrics["eligible_for_strict_aggregate"] is True
+    assert calibrated_run.metrics["eligible_for_calibrated_context_aggregate"] is True
+
+
+def test_context_calibration_is_cached_for_repeated_runs(
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.CONTEXT_SCALING],
+        execution_settings={
+            "repetitions": 2,
+            "warmup_runs": 1,
+            "warmup_enabled": False,
+        },
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONTEXT_SCALING, 4096)[0]
+    expanded_plan = [
+        PlannedRun(
+            run_id="run-context-calibration-1",
+            run_index=1,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONTEXT_SCALING,
+            benchmark_type_index=1,
+            scenario_id=scenario.scenario_id,
+            scenario_index=1,
+            repetition_index=1,
+            scenario_name=scenario.name,
+            scenario_version=scenario.version,
+        ),
+        PlannedRun(
+            run_id="run-context-calibration-2",
+            run_index=2,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONTEXT_SCALING,
+            benchmark_type_index=1,
+            scenario_id=scenario.scenario_id,
+            scenario_index=1,
+            repetition_index=2,
+            scenario_name=scenario.name,
+            scenario_version=scenario.version,
+        ),
+    ]
+    call_log: list[int] = []
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            call_log.append(int(options["num_predict"]))
+            return {
+                "response": "ok",
+                "total_duration": 1_000_000,
+                "prompt_eval_count": 1024,
+                "prompt_eval_duration": 1_000_000_000,
+                "eval_count": 4,
+                "eval_duration": 500_000_000,
+            }
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        expanded_plan=expanded_plan,
+        session_timestamp=datetime(2026, 4, 19, 13, 20, 0, tzinfo=timezone.utc),
+    )
+
+    assert call_log.count(1) == 1
+    assert call_log.count(64) == 2
+    assert [run.metrics["calibration_status"] for run in result.runs] == ["exact", "exact"]
+    assert [run.metrics["actual_prompt_tokens"] for run in result.runs] == [1024, 1024]
+    assert [run.metrics["calibration_cache_hit"] for run in result.runs] == [False, True]
+
+
+def test_context_calibration_marks_non_converged_runs_approximate(
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.CONTEXT_SCALING],
+        execution_settings={
+            "repetitions": 1,
+            "warmup_runs": 1,
+            "warmup_enabled": False,
+        },
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONTEXT_SCALING, 4096)[0]
+    expanded_plan = [
+        PlannedRun(
+            run_id="run-context-calibration-failed",
+            run_index=1,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONTEXT_SCALING,
+            benchmark_type_index=1,
+            scenario_id=scenario.scenario_id,
+            scenario_index=1,
+            repetition_index=1,
+            scenario_name=scenario.name,
+            scenario_version=scenario.version,
+        )
+    ]
+    call_log: list[int] = []
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            call_log.append(int(options["num_predict"]))
+            return {
+                "response": "ok",
+                "total_duration": 1_000_000,
+                "prompt_eval_count": 900,
+                "prompt_eval_duration": 1_000_000_000,
+                "eval_count": 4,
+                "eval_duration": 500_000_000,
+            }
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        expanded_plan=expanded_plan,
+        session_timestamp=datetime(2026, 4, 19, 13, 25, 0, tzinfo=timezone.utc),
+    )
+
+    calibrated_run = result.runs[0]
+    assert len(call_log) == 5
+    assert call_log[0] == 1
+    assert call_log[-1] == 64
+    assert calibrated_run.state is RunState.COMPLETED
+    assert calibrated_run.metrics["calibration_status"] == "approximate"
+    assert calibrated_run.metrics["calibration_attempts"] == 4
+    assert calibrated_run.metrics["actual_prompt_tokens"] == 900
+    assert calibrated_run.metrics["eligible_for_strict_aggregate"] is True
+    assert calibrated_run.metrics["eligible_for_calibrated_context_aggregate"] is True
+
+
+def test_context_calibration_failure_is_ineligible_for_strict_aggregates(
+    tmp_path: Path,
+) -> None:
+    plan = BenchmarkSessionPlan(
+        model_name="llama3.2",
+        contexts=[4096],
+        benchmark_types=[BenchmarkType.CONTEXT_SCALING],
+        execution_settings={
+            "repetitions": 1,
+            "warmup_runs": 1,
+            "warmup_enabled": False,
+        },
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONTEXT_SCALING, 4096)[0]
+    expanded_plan = [
+        PlannedRun(
+            run_id="run-context-calibration-invalid",
+            run_index=1,
+            model_name=plan.model_name,
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONTEXT_SCALING,
+            benchmark_type_index=1,
+            scenario_id=scenario.scenario_id,
+            scenario_index=1,
+            repetition_index=1,
+            scenario_name=scenario.name,
+            scenario_version=scenario.version,
+        )
+    ]
+    call_log: list[int] = []
+
+    class FakeClient:
+        def list_models(self) -> list[str]:
+            return [plan.model_name]
+
+        def generate(self, *, model: str, prompt: str, options: dict[str, object]) -> dict[str, object]:
+            call_log.append(int(options["num_predict"]))
+            return {
+                "response": "ok",
+                "total_duration": 1_000_000,
+                "prompt_eval_count": None,
+                "prompt_eval_duration": 1_000_000_000,
+                "eval_count": 4,
+                "eval_duration": 500_000_000,
+            }
+
+    result = run_profile_session(
+        plan=plan,
+        client=FakeClient(),
+        output_dir=tmp_path,
+        expanded_plan=expanded_plan,
+        session_timestamp=datetime(2026, 4, 19, 13, 30, 0, tzinfo=timezone.utc),
+    )
+
+    calibrated_run = result.runs[0]
+    assert call_log == [1, 64]
+    assert calibrated_run.metrics["calibration_status"] == "failed"
+    assert calibrated_run.metrics["calibration_attempts"] == 1
+    assert calibrated_run.metrics["actual_prompt_tokens"] is None
+    assert calibrated_run.metrics["eligible_for_strict_aggregate"] is False
+    assert calibrated_run.metrics["eligible_for_calibrated_context_aggregate"] is False
 
 
 def test_run_profile_session_warms_once_per_model_context_boundary(
