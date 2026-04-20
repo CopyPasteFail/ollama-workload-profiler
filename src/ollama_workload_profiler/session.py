@@ -696,15 +696,36 @@ def _response_elapsed_ms(
 
 def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
     metrics: dict[str, Any] = {}
-    for key in ("prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
+    for key in ("load_duration", "prompt_eval_count", "prompt_eval_duration", "eval_count", "eval_duration"):
         value = response.get(key)
         if isinstance(value, (int, float)):
             metrics[key] = value
 
+    load_duration = response.get("load_duration")
+    if isinstance(load_duration, (int, float)):
+        metrics["load_duration_ms"] = round(float(load_duration) / 1_000_000, 3)
+
+    prompt_eval_count = response.get("prompt_eval_count")
+    prompt_eval_duration = response.get("prompt_eval_duration")
+    if (
+        isinstance(prompt_eval_count, (int, float))
+        and isinstance(prompt_eval_duration, (int, float))
+        and prompt_eval_duration
+    ):
+        metrics["prompt_tokens_per_second"] = round(
+            float(prompt_eval_count) / (float(prompt_eval_duration) / 1_000_000_000),
+            3,
+        )
+
     eval_count = response.get("eval_count")
     eval_duration = response.get("eval_duration")
     if isinstance(eval_count, (int, float)) and isinstance(eval_duration, (int, float)) and eval_duration:
-        metrics["tokens_per_second"] = round(float(eval_count) / (float(eval_duration) / 1_000_000_000), 3)
+        generation_tokens_per_second = round(
+            float(eval_count) / (float(eval_duration) / 1_000_000_000),
+            3,
+        )
+        metrics["generation_tokens_per_second"] = generation_tokens_per_second
+        metrics["tokens_per_second"] = generation_tokens_per_second
 
     return metrics
 

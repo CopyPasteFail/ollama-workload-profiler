@@ -38,6 +38,7 @@ from ollama_workload_profiler.prompts.scenarios import (
 from ollama_workload_profiler.session import (
     TerminalProgressReporter,
     _OllamaDispatcher,
+    _response_metrics,
     _requested_repetitions,
     build_profile_session_plan,
     expand_session_plan,
@@ -1236,6 +1237,28 @@ def test_ollama_dispatcher_uses_stream_generate_for_ttft_and_measures_first_toke
     assert result.metrics["ttft_ms"] == 50.0
     assert result.metrics["ttft_first_token_received"] is True
     assert result.metrics["tokens_per_second"] == 16000.0
+
+
+def test_response_metrics_extracts_load_and_prompt_generation_throughput() -> None:
+    response = {
+        "load_duration": 2_500_000,
+        "prompt_eval_count": 10,
+        "prompt_eval_duration": 2_000_000,
+        "eval_count": 4,
+        "eval_duration": 500_000,
+    }
+
+    metrics = _response_metrics(response)
+
+    assert metrics["load_duration"] == 2_500_000
+    assert metrics["load_duration_ms"] == 2.5
+    assert metrics["prompt_eval_count"] == 10
+    assert metrics["prompt_eval_duration"] == 2_000_000
+    assert metrics["prompt_tokens_per_second"] == 5000.0
+    assert metrics["eval_count"] == 4
+    assert metrics["eval_duration"] == 500_000
+    assert metrics["generation_tokens_per_second"] == 8000.0
+    assert metrics["tokens_per_second"] == 8000.0
 
 
 def test_benchmark_runner_threads_execution_settings_into_dispatcher_request() -> None:
