@@ -311,6 +311,138 @@ def test_build_report_summary_prefers_explicit_failure_payloads() -> None:
     assert summary.failures[0].exception_class == "RuntimeError"
 
 
+def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates() -> None:
+    runs = [
+        RunResult(
+            run_id="run-0001",
+            run_index=1,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type="smoke",
+            benchmark_type_index=1,
+            scenario_id="smoke-basic-v1",
+            scenario_index=1,
+            state=RunState.COMPLETED,
+            elapsed_ms=10.0,
+            metrics={
+                "eligible_for_strict_aggregate": True,
+                "eligible_for_ttft_aggregate": True,
+                "load_duration_ms": 5.0,
+                "ttft_ms": 100.0,
+                "prompt_tokens_per_second": 1000.0,
+                "generation_tokens_per_second": 10.0,
+                "tokens_per_second": 10.0,
+            },
+        ),
+        RunResult(
+            run_id="run-0002",
+            run_index=2,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type="smoke",
+            benchmark_type_index=1,
+            scenario_id="smoke-basic-v1",
+            scenario_index=1,
+            state=RunState.COMPLETED,
+            elapsed_ms=20.0,
+            metrics={
+                "eligible_for_strict_aggregate": True,
+                "eligible_for_ttft_aggregate": True,
+                "load_duration_ms": 7.0,
+                "ttft_ms": 200.0,
+                "prompt_tokens_per_second": 2000.0,
+                "generation_tokens_per_second": 20.0,
+                "tokens_per_second": 20.0,
+            },
+        ),
+        RunResult(
+            run_id="run-0003",
+            run_index=3,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type="smoke",
+            benchmark_type_index=1,
+            scenario_id="smoke-basic-v1",
+            scenario_index=1,
+            state=RunState.COMPLETED,
+            elapsed_ms=999.0,
+            metrics={
+                "eligible_for_strict_aggregate": False,
+                "eligible_for_ttft_aggregate": False,
+                "load_duration_ms": 50.0,
+                "ttft_ms": 5000.0,
+                "prompt_tokens_per_second": 9000.0,
+                "generation_tokens_per_second": 90.0,
+                "tokens_per_second": 90.0,
+            },
+        ),
+        RunResult(
+            run_id="run-0004",
+            run_index=4,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type="smoke",
+            benchmark_type_index=1,
+            scenario_id="smoke-basic-v1",
+            scenario_index=1,
+            state=RunState.FAILED,
+            elapsed_ms=2500.0,
+            metrics={
+                "eligible_for_strict_aggregate": False,
+                "eligible_for_ttft_aggregate": False,
+                "load_duration_ms": 120.0,
+                "ttft_ms": 8000.0,
+                "prompt_tokens_per_second": 12000.0,
+                "generation_tokens_per_second": 120.0,
+                "tokens_per_second": 120.0,
+            },
+        ),
+    ]
+
+    summary = build_report_summary(plan={"model_name": "llama3.2"}, environment={}, runs=runs)
+
+    assert summary.session_metrics["completed_sample_size"] == 3
+    assert summary.session_metrics["elapsed_ms_median"] == 20.0
+    assert summary.session_metrics["elapsed_ms_p95"] == 999.0
+    assert summary.session_metrics["ttft_ms_sample_size"] == 3
+    assert summary.session_metrics["ttft_ms_median"] == 200.0
+    assert summary.session_metrics["ttft_ms_p95"] == 5000.0
+    assert summary.session_metrics["prompt_tokens_per_second_sample_size"] == 3
+    assert summary.session_metrics["prompt_tokens_per_second_median"] == 2000.0
+    assert summary.session_metrics["prompt_tokens_per_second_p95"] == 9000.0
+    assert summary.session_metrics["generation_tokens_per_second_sample_size"] == 3
+    assert summary.session_metrics["generation_tokens_per_second_median"] == 20.0
+    assert summary.session_metrics["generation_tokens_per_second_p95"] == 90.0
+    assert summary.session_metrics["load_duration_ms_sample_size"] == 3
+    assert summary.session_metrics["load_duration_ms_median"] == 7.0
+    assert summary.session_metrics["load_duration_ms_p95"] == 50.0
+
+    model_summary = summary.model_summaries["llama3.2"]
+    assert model_summary.metrics["completed_sample_size"] == 3
+    assert model_summary.metrics["generation_tokens_per_second_median"] == 20.0
+    assert model_summary.metrics["generation_tokens_per_second_p95"] == 90.0
+
+    benchmark_summary = summary.benchmark_summaries[0]
+    assert benchmark_summary["sample_size"] == 4
+    assert benchmark_summary["completed_runs"] == 3
+    assert benchmark_summary["strict_sample_size"] == 2
+    assert benchmark_summary["elapsed_ms_median"] == 15.0
+    assert benchmark_summary["elapsed_ms_p95"] == 20.0
+    assert benchmark_summary["ttft_ms_sample_size"] == 2
+    assert benchmark_summary["ttft_ms_median"] == 150.0
+    assert benchmark_summary["ttft_ms_p95"] == 200.0
+    assert benchmark_summary["prompt_tokens_per_second_median"] == 1500.0
+    assert benchmark_summary["prompt_tokens_per_second_p95"] == 2000.0
+    assert benchmark_summary["generation_tokens_per_second_median"] == 15.0
+    assert benchmark_summary["generation_tokens_per_second_p95"] == 20.0
+    assert benchmark_summary["load_duration_ms_median"] == 6.0
+    assert benchmark_summary["load_duration_ms_p95"] == 7.0
+
+
 def test_render_markdown_report_contains_required_sections_and_handles_minimal_data() -> None:
     summary = build_report_summary(plan={"model_name": "llama3.2"}, environment={}, runs=[])
 
@@ -326,6 +458,70 @@ def test_render_markdown_report_contains_required_sections_and_handles_minimal_d
     assert "## Plain-language recommendations" in markdown
     assert "No completed runs were recorded." in markdown
     assert "Artifacts:" not in markdown
+
+
+def test_render_markdown_report_surfaces_completed_sample_stats_without_alias_leakage() -> None:
+    summary = build_report_summary(
+        plan={"model_name": "llama3.2"},
+        environment={},
+        runs=[
+            RunResult(
+                run_id="run-0001",
+                run_index=1,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type="smoke",
+                benchmark_type_index=1,
+                scenario_id="smoke-basic-v1",
+                scenario_index=1,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "eligible_for_ttft_aggregate": True,
+                    "load_duration_ms": 5.0,
+                    "ttft_ms": 100.0,
+                    "prompt_tokens_per_second": 1000.0,
+                    "generation_tokens_per_second": 10.0,
+                    "tokens_per_second": 10.0,
+                },
+            ),
+            RunResult(
+                run_id="run-0002",
+                run_index=2,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type="smoke",
+                benchmark_type_index=1,
+                scenario_id="smoke-basic-v1",
+                scenario_index=1,
+                state=RunState.COMPLETED,
+                elapsed_ms=20.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "eligible_for_ttft_aggregate": True,
+                    "load_duration_ms": 7.0,
+                    "ttft_ms": 200.0,
+                    "prompt_tokens_per_second": 2000.0,
+                    "generation_tokens_per_second": 20.0,
+                    "tokens_per_second": 20.0,
+                },
+            ),
+        ],
+    )
+
+    markdown = render_markdown_report(summary)
+
+    assert "Completed samples: 2 of 2 runs" in markdown
+    assert "elapsed_ms: median 15.0 | p95 20.0 | n=2" in markdown
+    assert "ttft_ms: median 150.0 | p95 200.0 | n=2" in markdown
+    assert "prompt_tokens_per_second: median 1500.0 | p95 2000.0 | n=2" in markdown
+    assert "generation_tokens_per_second: median 15.0 | p95 20.0 | n=2" in markdown
+    assert "load_duration_ms: median 6.0 | p95 7.0 | n=2" in markdown
+    assert "\n- tokens_per_second:" not in markdown
+    assert "| tokens_per_second |" not in markdown
 
 
 def test_render_markdown_report_uses_only_the_required_section_contract() -> None:

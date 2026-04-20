@@ -8,6 +8,7 @@ def render_markdown_report(summary: ReportSummary) -> str:
     lines: list[str] = ["# Benchmark Report", ""]
 
     lines.extend(["## Executive summary", "", summary.executive_summary or "No summary available.", ""])
+    lines.extend(_render_session_summary(summary))
 
     lines.extend(["## Per-model summary", ""])
     if summary.model_summaries:
@@ -17,7 +18,8 @@ def render_markdown_report(summary: ReportSummary) -> str:
             lines.append(model_summary.summary or "No completed runs were recorded.")
             lines.append("")
             if model_summary.metrics:
-                for metric_name, metric_value in sorted(model_summary.metrics.items()):
+                lines.extend(_render_metric_summary_block(model_summary.metrics))
+                for metric_name, metric_value in _remaining_metrics(model_summary.metrics):
                     lines.append(f"- `{metric_name}`: {_display_value(metric_value)}")
                 lines.append("")
             if model_summary.notes:
@@ -87,3 +89,60 @@ def _display_value(value: object) -> str:
         label = value.verdict_label.display_label if value.verdict_label is not None else "No verdict"
         return f"{label} | {value.supporting_tuple}"
     return str(value)
+
+
+def _render_session_summary(summary: ReportSummary) -> list[str]:
+    metrics = summary.session_metrics
+    if not metrics:
+        return []
+
+    lines = [
+        f"Completed samples: {metrics.get('completed_sample_size', 0)} of {metrics.get('run_count', 0)} runs",
+        "",
+    ]
+    lines.extend(_render_metric_summary_block(metrics))
+    if len(lines) > 2:
+        lines.append("")
+    return lines
+
+
+def _render_metric_summary_block(metrics: dict[str, object]) -> list[str]:
+    lines: list[str] = []
+    for metric_name in (
+        "elapsed_ms",
+        "ttft_ms",
+        "prompt_tokens_per_second",
+        "generation_tokens_per_second",
+        "load_duration_ms",
+    ):
+        sample_size = metrics.get(f"{metric_name}_sample_size")
+        median_value = metrics.get(f"{metric_name}_median")
+        p95_value = metrics.get(f"{metric_name}_p95")
+        if sample_size:
+            lines.append(f"- {metric_name}: median {_display_value(median_value)} | p95 {_display_value(p95_value)} | n={sample_size}")
+        else:
+            lines.append(f"- {metric_name}: unavailable | n=0")
+    return lines
+
+
+def _remaining_metrics(metrics: dict[str, object]) -> list[tuple[str, object]]:
+    hidden_keys = {"tokens_per_second"}
+    for metric_name in (
+        "elapsed_ms",
+        "ttft_ms",
+        "prompt_tokens_per_second",
+        "generation_tokens_per_second",
+        "load_duration_ms",
+    ):
+        hidden_keys.add(f"{metric_name}_sample_size")
+        hidden_keys.add(f"{metric_name}_median")
+        hidden_keys.add(f"{metric_name}_p95")
+
+    return sorted(
+        (
+            (metric_name, metric_value)
+            for metric_name, metric_value in metrics.items()
+            if metric_name not in hidden_keys
+        ),
+        key=lambda item: item[0],
+    )

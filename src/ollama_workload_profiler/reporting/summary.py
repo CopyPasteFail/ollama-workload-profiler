@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
-from statistics import mean
+from math import ceil
+from statistics import median
 from typing import Any, Mapping, Sequence
 
 from pydantic import BaseModel
@@ -55,17 +56,16 @@ def _to_json_payload(value: Mapping[str, Any] | BaseModel) -> dict[str, Any]:
 
 def _build_session_metrics(plan_payload: dict[str, Any], run_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     state_counts: dict[str, int] = defaultdict(int)
-    completed_elapsed_ms: list[float] = []
+    completed_runs: list[dict[str, Any]] = []
 
     for run in run_payloads:
         state = str(run.get("state", "unknown"))
         state_counts[state] += 1
 
-        elapsed_ms = run.get("elapsed_ms")
-        if state == "completed" and isinstance(elapsed_ms, int | float):
-            completed_elapsed_ms.append(float(elapsed_ms))
+        if state == "completed":
+            completed_runs.append(run)
 
-    return {
+    metrics = {
         "planned_run_count": len(run_payloads) or None,
         "run_count": len(run_payloads),
         "completed_runs": state_counts.get("completed", 0),
@@ -76,21 +76,34 @@ def _build_session_metrics(plan_payload: dict[str, Any], run_payloads: list[dict
         "model_count": len({run.get("model_name") for run in run_payloads if run.get("model_name")}),
         "context_count": len({run.get("context_size") for run in run_payloads if run.get("context_size") is not None}),
         "benchmark_count": len({run.get("benchmark_type") for run in run_payloads if run.get("benchmark_type")}),
-        "avg_completed_elapsed_ms": round(mean(completed_elapsed_ms), 3) if completed_elapsed_ms else None,
+        "completed_sample_size": len(completed_runs),
     }
+    metrics.update(_build_metric_summary(completed_runs, "elapsed_ms", source="run"))
+    metrics.update(_build_metric_summary(completed_runs, "ttft_ms"))
+    metrics.update(_build_metric_summary(completed_runs, "prompt_tokens_per_second"))
+    metrics.update(_build_metric_summary(completed_runs, "generation_tokens_per_second"))
+    metrics.update(_build_metric_summary(completed_runs, "load_duration_ms"))
+    return metrics
 
 
 def _build_executive_summary(session_metrics: dict[str, Any], plan_payload: dict[str, Any]) -> str:
     completed_runs = int(session_metrics.get("completed_runs") or 0)
     run_count = int(session_metrics.get("run_count") or 0)
-    failed_runs = int(session_metrics.get("failed_runs") or 0)
     model_name = plan_payload.get("model_name")
 
     if completed_runs == 0:
         return "No completed runs were recorded."
 
     model_fragment = f" for {model_name}" if model_name else ""
-    return f"{completed_runs} of {run_count} runs completed successfully{model_fragment}; {failed_runs} failed."
+    headline_parts = [
+        f"{completed_runs} of {run_count} runs completed successfully{model_fragment}.",
+        _format_metric_headline(session_metrics, "elapsed_ms"),
+        _format_metric_headline(session_metrics, "ttft_ms"),
+        _format_metric_headline(session_metrics, "prompt_tokens_per_second"),
+        _format_metric_headline(session_metrics, "generation_tokens_per_second"),
+        _format_metric_headline(session_metrics, "load_duration_ms"),
+    ]
+    return " ".join(part for part in headline_parts if part)
 
 
 def _build_model_summaries(run_payloads: list[dict[str, Any]]) -> dict[str, ModelSummary]:
@@ -101,23 +114,28 @@ def _build_model_summaries(run_payloads: list[dict[str, Any]]) -> dict[str, Mode
 
     model_summaries: dict[str, ModelSummary] = {}
     for model_name, grouped in grouped_runs.items():
-        completed_elapsed_ms = [
-            float(run["elapsed_ms"])
-            for run in grouped
-            if run.get("state") == "completed" and isinstance(run.get("elapsed_ms"), int | float)
-        ]
+        completed_runs = [run for run in grouped if run.get("state") == "completed"]
+        metric_summary: dict[str, Any] = {
+            "run_count": len(grouped),
+            "completed_runs": len(completed_runs),
+            "failed_runs": sum(1 for run in grouped if run.get("state") == "failed"),
+            "completed_sample_size": len(completed_runs),
+        }
+        metric_summary.update(_build_metric_summary(completed_runs, "elapsed_ms", source="run"))
+        metric_summary.update(_build_metric_summary(completed_runs, "ttft_ms"))
+        metric_summary.update(_build_metric_summary(completed_runs, "prompt_tokens_per_second"))
+        metric_summary.update(_build_metric_summary(completed_runs, "generation_tokens_per_second"))
+        metric_summary.update(_build_metric_summary(completed_runs, "load_duration_ms"))
         model_summaries[model_name] = ModelSummary(
             summary=(
                 "No completed runs were recorded."
-                if not completed_elapsed_ms
-                else f"{len(completed_elapsed_ms)} completed run(s) recorded."
+                if not completed_runs
+                else (
+                    f"{len(completed_runs)} completed sample(s) out of {len(grouped)} run(s). "
+                    f"{_format_metric_headline(metric_summary, 'elapsed_ms')}"
+                ).strip()
             ),
-            metrics={
-                "run_count": len(grouped),
-                "completed_runs": sum(1 for run in grouped if run.get("state") == "completed"),
-                "failed_runs": sum(1 for run in grouped if run.get("state") == "failed"),
-                "avg_elapsed_ms": round(mean(completed_elapsed_ms), 3) if completed_elapsed_ms else None,
-            },
+            metrics=metric_summary,
             notes=_model_notes(grouped),
         )
     return model_summaries
@@ -146,16 +164,11 @@ def _build_benchmark_summaries(run_payloads: list[dict[str, Any]]) -> list[dict[
     rows: list[dict[str, Any]] = []
     for key in sorted(grouped_runs, key=lambda item: tuple("" if part is None else str(part) for part in item)):
         grouped = grouped_runs[key]
-        elapsed_values = [
-            float(run["elapsed_ms"])
-            for run in grouped
-            if run.get("state") == "completed" and isinstance(run.get("elapsed_ms"), int | float)
-        ]
-        tps_values = [
-            float(run["metrics"]["tokens_per_second"])
-            for run in grouped
-            if isinstance(run.get("metrics"), dict)
-            and isinstance(run["metrics"].get("tokens_per_second"), int | float)
+        completed_runs = [run for run in grouped if run.get("state") == "completed"]
+        strict_runs = [
+            run
+            for run in completed_runs
+            if _metric_bool(run, "eligible_for_strict_aggregate")
         ]
         rows.append(
             {
@@ -164,11 +177,19 @@ def _build_benchmark_summaries(run_payloads: list[dict[str, Any]]) -> list[dict[
                 "benchmark_type": key[2],
                 "scenario_id": key[3],
                 "sample_size": len(grouped),
-                "completed_runs": sum(1 for run in grouped if run.get("state") == "completed"),
+                "completed_runs": len(completed_runs),
                 "failed_runs": sum(1 for run in grouped if run.get("state") == "failed"),
                 "stopped_runs": sum(1 for run in grouped if run.get("state") == "stopped"),
-                "avg_elapsed_ms": round(mean(elapsed_values), 3) if elapsed_values else None,
-                "max_tokens_per_second": round(max(tps_values), 3) if tps_values else None,
+                "strict_sample_size": len(strict_runs),
+                **_build_metric_summary(strict_runs, "elapsed_ms", source="run"),
+                **_build_metric_summary(
+                    strict_runs,
+                    "ttft_ms",
+                    eligibility_flag="eligible_for_ttft_aggregate",
+                ),
+                **_build_metric_summary(strict_runs, "prompt_tokens_per_second"),
+                **_build_metric_summary(strict_runs, "generation_tokens_per_second"),
+                **_build_metric_summary(strict_runs, "load_duration_ms"),
             }
         )
     return rows
@@ -288,6 +309,67 @@ def _build_recommendations(session_metrics: dict[str, Any]) -> list[str]:
     if int(session_metrics.get("completed_runs") or 0) == 0:
         return ["Run at least one benchmark to generate performance recommendations."]
     return ["Use raw.jsonl for per-run inspection and summary.json for aggregate comparisons."]
+
+
+def _build_metric_summary(
+    runs: Sequence[dict[str, Any]],
+    metric_name: str,
+    *,
+    source: str = "metrics",
+    eligibility_flag: str | None = None,
+) -> dict[str, Any]:
+    values: list[float] = []
+    for run in runs:
+        if eligibility_flag and not _metric_bool(run, eligibility_flag):
+            continue
+        value = _numeric_metric_value(run, metric_name, source=source)
+        if value is not None:
+            values.append(value)
+
+    return {
+        f"{metric_name}_sample_size": len(values),
+        f"{metric_name}_median": _round_metric(median(values)) if values else None,
+        f"{metric_name}_p95": _round_metric(_p95_nearest_rank(values)) if values else None,
+    }
+
+
+def _numeric_metric_value(run: Mapping[str, Any], metric_name: str, *, source: str) -> float | None:
+    if source == "run":
+        value = run.get(metric_name)
+    else:
+        metrics = run.get("metrics")
+        if not isinstance(metrics, dict):
+            return None
+        value = metrics.get(metric_name)
+        if metric_name == "generation_tokens_per_second" and not isinstance(value, (int, float)):
+            value = metrics.get("tokens_per_second")
+    if not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _metric_bool(run: Mapping[str, Any], metric_name: str) -> bool:
+    metrics = run.get("metrics")
+    return isinstance(metrics, dict) and bool(metrics.get(metric_name))
+
+
+def _round_metric(value: float) -> float:
+    return round(float(value), 3)
+
+
+def _p95_nearest_rank(values: Sequence[float]) -> float:
+    ordered = sorted(float(value) for value in values)
+    rank = max(1, ceil(len(ordered) * 0.95))
+    return ordered[rank - 1]
+
+
+def _format_metric_headline(metrics: Mapping[str, Any], metric_name: str) -> str:
+    sample_size = metrics.get(f"{metric_name}_sample_size")
+    median_value = metrics.get(f"{metric_name}_median")
+    p95_value = metrics.get(f"{metric_name}_p95")
+    if not sample_size:
+        return f"{metric_name} unavailable."
+    return f"{metric_name} median {median_value}, p95 {p95_value} (n={sample_size})."
 
 
 def _optional_str(value: object) -> str | None:
