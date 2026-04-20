@@ -24,6 +24,41 @@ def test_list_models_returns_model_names() -> None:
     assert client.list_models() == ["llama3.2:latest", "mistral:7b"]
 
 
+def test_version_returns_string_from_api_version() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/api/version"
+        return httpx.Response(200, json={"version": "0.6.0"}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.version() == "0.6.0"
+
+
+def test_show_model_posts_name_to_api_show() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/show"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={"details": {"family": "llama"}, "model_info": {"general.architecture": "llama"}},
+            request=request,
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.show_model("llama3.2:latest") == {
+        "details": {"family": "llama"},
+        "model_info": {"general.architecture": "llama"},
+    }
+    assert seen_payload == {"name": "llama3.2:latest"}
+
+
 def test_generate_defaults_to_non_streaming_requests() -> None:
     seen_payload: dict[str, object] = {}
 
@@ -111,6 +146,47 @@ def test_stream_chat_sends_streaming_payload_and_yields_chunks() -> None:
         {"message": {"role": "assistant", "content": "first"}, "done": False},
         {"message": {"role": "assistant", "content": "second"}, "done": True},
     ]
+
+
+def test_unload_model_requests_keep_alive_zero() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/generate"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(200, json={"done": True, "done_reason": "unload"}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.unload_model(model="llama3.2") == {"done": True, "done_reason": "unload"}
+    assert seen_payload == {"model": "llama3.2", "keep_alive": 0}
+
+
+def test_preload_model_requests_keep_alive_negative_one() -> None:
+    seen_payload: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/api/generate"
+        seen_payload.update(json.loads(request.content))
+        return httpx.Response(200, json={"done": True}, request=request)
+
+    transport = httpx.MockTransport(handler)
+    client = OllamaClient(transport=transport)
+
+    assert client.preload_model(
+        model="llama3.2",
+        options={"num_ctx": 4096, "seed": 42, "temperature": 0.0},
+    ) == {"done": True}
+    assert seen_payload == {
+        "model": "llama3.2",
+        "keep_alive": -1,
+        "prompt": "",
+        "stream": False,
+        "options": {"num_ctx": 4096, "seed": 42, "temperature": 0.0},
+    }
 
 
 def test_client_accepts_timeout_and_passes_it_to_httpx_client(monkeypatch) -> None:

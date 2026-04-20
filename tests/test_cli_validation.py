@@ -32,6 +32,73 @@ def test_profile_help_includes_live_progress_flag() -> None:
     assert "--live-progress" in result.stdout
 
 
+def test_profile_help_includes_benchmark_policy_flags() -> None:
+    runner = CliRunner()
+    result = runner.invoke(app, ["profile", "--help"])
+
+    assert result.exit_code == 0
+    assert "--seed" in result.stdout
+    assert "--temperature" in result.stdout
+    assert "--top-p" in result.stdout
+    assert "--repetitions" in result.stdout
+    assert "--warmup-runs" in result.stdout
+    assert "--no-warmup" in result.stdout
+
+
+def test_profile_rejects_out_of_range_temperature_before_plan_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_build_profile_session_plan(*args: object, **kwargs: object) -> object:
+        raise AssertionError("plan construction should not run for invalid temperature")
+
+    monkeypatch.setattr("ollama_workload_profiler.cli.build_profile_session_plan", fake_build_profile_session_plan)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "profile",
+            "--model",
+            "llama3.2",
+            "--contexts",
+            "4096",
+            "--benchmark-types",
+            "smoke",
+            "--temperature",
+            "-0.1",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_profile_rejects_out_of_range_top_p_before_plan_construction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_build_profile_session_plan(*args: object, **kwargs: object) -> object:
+        raise AssertionError("plan construction should not run for invalid top_p")
+
+    monkeypatch.setattr("ollama_workload_profiler.cli.build_profile_session_plan", fake_build_profile_session_plan)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "profile",
+            "--model",
+            "llama3.2",
+            "--contexts",
+            "4096",
+            "--benchmark-types",
+            "smoke",
+            "--top-p",
+            "1.1",
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
 def test_build_terminal_echo_writes_directly_to_stdout_and_flushes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -161,6 +228,117 @@ def test_profile_command_parses_and_echoes_options(
     assert "Model: llama3.2" in result.stdout
     assert "Contexts: 8192, 4096" in result.stdout
     assert "Benchmark types: context-scaling, smoke" in result.stdout
+
+
+def test_profile_command_passes_requested_execution_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured_settings: dict[str, object] = {}
+
+    class FakeClient:
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *exc_info: object) -> None:
+            return None
+
+        def list_models(self) -> list[str]:
+            return ["llama3.2"]
+
+    def fake_build_profile_session_plan(
+        *,
+        model_name: str,
+        contexts: list[int],
+        benchmark_types: list[BenchmarkType],
+        execution_settings: dict[str, object],
+    ) -> object:
+        captured_settings.update(execution_settings)
+        return type(
+            "FakePlan",
+            (),
+            {
+                "model_name": model_name,
+                "contexts": contexts,
+                "benchmark_types": benchmark_types,
+                "execution_settings": execution_settings,
+            },
+        )()
+
+    def fake_expand_session_plan(plan: object) -> list[object]:
+        return []
+
+    def fake_summarize_session_budget(plan: object, *, expanded_plan: list[object]) -> dict[str, object]:
+        return {
+            "run_count": 0,
+            "scenario_count": 0,
+            "context_count": 1,
+            "benchmark_type_count": 1,
+            "repetitions": 1,
+            "warning": None,
+        }
+
+    def fake_run_profile_session(
+        *,
+        plan: object,
+        client: object,
+        output_dir: Path,
+        available_models: list[str],
+        expanded_plan: list[object],
+        progress_reporter: object,
+    ) -> object:
+        return type("FakeResult", (), {"session_dir": tmp_path / "session"})()
+
+    monkeypatch.setattr("ollama_workload_profiler.cli.OllamaClient", FakeClient)
+    monkeypatch.setattr("ollama_workload_profiler.cli.build_profile_session_plan", fake_build_profile_session_plan)
+    monkeypatch.setattr("ollama_workload_profiler.cli.expand_session_plan", fake_expand_session_plan)
+    monkeypatch.setattr("ollama_workload_profiler.cli.summarize_session_budget", fake_summarize_session_budget)
+    monkeypatch.setattr("ollama_workload_profiler.cli.run_profile_session", fake_run_profile_session)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app,
+        [
+            "profile",
+            "--model",
+            "llama3.2",
+            "--contexts",
+            "4096",
+            "--benchmark-types",
+            "smoke",
+            "--seed",
+            "7",
+            "--temperature",
+            "0.2",
+            "--top-p",
+            "0.9",
+            "--repetitions",
+            "3",
+            "--warmup-runs",
+            "2",
+            "--no-warmup",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        input="y\n",
+    )
+
+    assert result.exit_code == 0
+    assert captured_settings == {
+        "seed": 7,
+        "temperature": 0.2,
+        "top_p": 0.9,
+        "repetitions": 3,
+        "warmup_runs": 2,
+        "warmup_enabled": False,
+    }
+    assert "Benchmark policy:" in result.stdout
+    assert "seed=7" in result.stdout
+    assert "temperature=0.2" in result.stdout
+    assert "top_p=0.9" in result.stdout
+    assert "repetitions=3" in result.stdout
+    assert "warmup_runs=2" in result.stdout
+    assert "warmup_enabled=no" in result.stdout
 
 
 def test_profile_refuses_to_start_when_no_local_models_are_available(
