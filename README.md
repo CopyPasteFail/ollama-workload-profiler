@@ -1,6 +1,8 @@
 # Ollama Workload Profiler
 
-`ollama-workload-profiler` is a CLI-first local benchmarking and profiling tool for Ollama.
+`ollama-workload-profiler` is a CLI-first local benchmarking and profiling tool for Ollama on a single machine.
+
+It is designed for local serving and workload comparisons, not for scientific benchmarking and not for model-quality evaluation. This project does not run standardized quality suites such as MMLU or GSM8K. The goal is to make local Ollama runs more repeatable, more honest, and easier to explain in a blog post or hardware write-up.
 
 ## Install
 
@@ -49,6 +51,57 @@ The current CLI accepts `smoke`, `cold-warm`, `prompt-scaling`, `context-scaling
 
 Results are written to timestamped directories under `results/` by default.
 
+## Benchmark semantics
+
+The profiler now treats benchmark policy as first-class session data. Requested execution settings such as `seed`, `temperature`, `top_p`, `repetitions`, and warmup behavior are written into the session artifacts so runs are easier to reproduce and explain later.
+
+Cold and warm runs are enforced, not just labeled:
+
+- `cold-warm` cold scenarios explicitly unload the model before the measured run
+- `cold-warm` warm scenarios explicitly preload the model before the measured run
+- non-cold scenarios use a bounded session warmup once per `(model, context_size)` boundary unless warmup is disabled
+
+If a requested cold or warm preparation step cannot be enforced, the run artifacts say so directly and the run is excluded from strict aggregates.
+
+## Context-fill calibration
+
+`context-scaling` scenarios are token-targeted rather than character-targeted.
+
+For each context-fill scenario, the profiler:
+
+1. chooses a target prompt token count from the requested fill ratio
+2. probes Ollama and reads the returned `prompt_eval_count`
+3. adjusts the prompt and retries up to a bounded limit
+
+Calibration is cached per `(model, context_size, scenario_id, prompt_template_version)` so repetitions reuse the measured prompt instead of recalibrating every run.
+
+Calibration results are recorded as:
+
+- `exact`: actual prompt tokens landed within the calibration tolerance
+- `approximate`: calibration stayed bounded but did not converge inside the tolerance
+- `failed`: calibration could not be enforced or prompt token counts could not be confirmed
+
+`failed` context-fill samples remain in raw artifacts for transparency, but they are excluded from strict calibrated aggregates.
+
+## Metrics
+
+The key metrics are reported with explicit names:
+
+- `load_duration_ms`: model load time reported by Ollama. This is especially important for true cold-start runs.
+- `prompt_tokens_per_second`: prompt-side throughput from Ollama prompt evaluation counters.
+- `generation_tokens_per_second`: generation-side throughput from Ollama eval counters.
+- `ttft_ms`: time to first streamed model emission for TTFT scenarios.
+
+`tokens_per_second` is still stored as a backward-compatible alias of `generation_tokens_per_second`, but reports and summaries prefer the generation-specific name.
+
+Summary statistics are intentionally conservative:
+
+- `median`: the middle observed value for the included sample set
+- `p95`: the 95th percentile using a consistent nearest-rank method
+- `n`: the number of samples that qualified for that aggregate
+
+Aggregates use completed runs only, and strict benchmark summaries also respect prep and calibration eligibility flags.
+
 ## Validated On
 
 This release candidate was live-validated against a real local Ollama setup on `main`, including `owp doctor` and an interactive bounded `owp profile` run with seed artifacts, append-only raw results, telemetry, phase peaks, and TTFT capture on the chat-based path.
@@ -81,3 +134,4 @@ V1 is intentionally local and conservative:
 - consecutive execution only
 - fixed artifact filenames per session
 - benchmark families are deterministic and still intentionally local-first rather than distributed or concurrent
+- environment metadata such as accelerator details, VRAM, and some Ollama runtime/model fields are best-effort and may be partially unavailable depending on platform and local tooling
