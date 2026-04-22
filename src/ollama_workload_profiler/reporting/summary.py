@@ -17,6 +17,40 @@ from ..prompts.scenarios import build_scenarios_for_benchmark
 from .verdicts import build_missing_use_case_cell, summarize_use_case_cell
 
 
+SUMMARY_METRIC_NAMES: tuple[str, ...] = (
+    "elapsed_ms",
+    "ttft_ms",
+    "stream_emission_count",
+    "stream_duration_ms",
+    "stream_emission_interval_ms_median",
+    "stream_emission_interval_ms_p95",
+    "stream_output_units_per_second",
+    "concurrency_request_elapsed_ms_p50",
+    "concurrency_request_elapsed_ms_p95",
+    "concurrency_request_ttft_ms_p50",
+    "concurrency_request_ttft_ms_p95",
+    "available_system_memory_mb",
+    "system_cpu_load_snapshot",
+    "peak_gpu_memory_mb",
+    "avg_gpu_util_percent",
+    "peak_gpu_util_percent",
+    "prompt_eval_count",
+    "actual_prompt_tokens",
+    "target_prompt_tokens",
+    "prompt_tokens_per_second",
+    "generation_tokens_per_second",
+    "load_duration_ms",
+)
+
+SUMMARY_METRIC_DISPLAY_NAMES: dict[str, str] = {
+    "elapsed_ms": "run elapsed time",
+    "ttft_ms": "TTFT",
+    "prompt_tokens_per_second": "prompt tokens/s",
+    "generation_tokens_per_second": "generation tokens/s",
+    "load_duration_ms": "load duration",
+}
+
+
 def build_report_summary(
     *,
     plan: Mapping[str, Any] | BaseModel,
@@ -97,11 +131,14 @@ def _build_session_metrics(plan_payload: dict[str, Any], run_payloads: list[dict
         "benchmark_count": len({run.get("benchmark_type") for run in run_payloads if run.get("benchmark_type")}),
         "completed_sample_size": len(completed_runs),
     }
-    metrics.update(_build_metric_summary(completed_runs, "elapsed_ms", source="run"))
-    metrics.update(_build_metric_summary(completed_runs, "ttft_ms"))
-    metrics.update(_build_metric_summary(completed_runs, "prompt_tokens_per_second"))
-    metrics.update(_build_metric_summary(completed_runs, "generation_tokens_per_second"))
-    metrics.update(_build_metric_summary(completed_runs, "load_duration_ms"))
+    for metric_name in SUMMARY_METRIC_NAMES:
+        metrics.update(
+            _build_metric_summary(
+                completed_runs,
+                metric_name,
+                source=_summary_metric_source(metric_name),
+            )
+        )
     return metrics
 
 
@@ -140,11 +177,14 @@ def _build_model_summaries(run_payloads: list[dict[str, Any]]) -> dict[str, Mode
             "failed_runs": sum(1 for run in grouped if run.get("state") == "failed"),
             "completed_sample_size": len(completed_runs),
         }
-        metric_summary.update(_build_metric_summary(completed_runs, "elapsed_ms", source="run"))
-        metric_summary.update(_build_metric_summary(completed_runs, "ttft_ms"))
-        metric_summary.update(_build_metric_summary(completed_runs, "prompt_tokens_per_second"))
-        metric_summary.update(_build_metric_summary(completed_runs, "generation_tokens_per_second"))
-        metric_summary.update(_build_metric_summary(completed_runs, "load_duration_ms"))
+        for metric_name in SUMMARY_METRIC_NAMES:
+            metric_summary.update(
+                _build_metric_summary(
+                    completed_runs,
+                    metric_name,
+                    source=_summary_metric_source(metric_name),
+                )
+            )
         model_summaries[model_name] = ModelSummary(
             summary=(
                 "No completed runs were recorded."
@@ -200,15 +240,7 @@ def _build_benchmark_summaries(run_payloads: list[dict[str, Any]]) -> list[dict[
                 "failed_runs": sum(1 for run in grouped if run.get("state") == "failed"),
                 "stopped_runs": sum(1 for run in grouped if run.get("state") == "stopped"),
                 "strict_sample_size": len(strict_runs),
-                **_build_metric_summary(strict_runs, "elapsed_ms", source="run"),
-                **_build_metric_summary(
-                    strict_runs,
-                    "ttft_ms",
-                    eligibility_flag="eligible_for_ttft_aggregate",
-                ),
-                **_build_metric_summary(strict_runs, "prompt_tokens_per_second"),
-                **_build_metric_summary(strict_runs, "generation_tokens_per_second"),
-                **_build_metric_summary(strict_runs, "load_duration_ms"),
+                **_build_benchmark_metric_summaries(strict_runs),
             }
         )
     return rows
@@ -244,6 +276,20 @@ def _build_phase_peak_summaries(run_payloads: list[dict[str, Any]]) -> list[dict
         }
         for phase, values in sorted(phase_aggregates.items())
     ]
+
+
+def _build_benchmark_metric_summaries(strict_runs: list[dict[str, Any]]) -> dict[str, Any]:
+    summaries: dict[str, Any] = {}
+    for metric_name in SUMMARY_METRIC_NAMES:
+        summaries.update(
+            _build_metric_summary(
+                strict_runs,
+                metric_name,
+                source=_summary_metric_source(metric_name),
+                eligibility_flag="eligible_for_ttft_aggregate" if metric_name == "ttft_ms" else None,
+            )
+        )
+    return summaries
 
 
 def _build_use_case_matrix(
@@ -319,6 +365,10 @@ def _build_warnings(session_metrics: dict[str, Any], run_payloads: list[dict[str
         warnings.append("One or more runs failed; review raw.jsonl for per-run details.")
     if int(session_metrics.get("stopped_runs") or 0) > 0:
         warnings.append("One or more runs stopped before completion.")
+    host_pressure_reasons = _host_pressure_warning_reasons(run_payloads)
+    if host_pressure_reasons:
+        warnings.append("One or more runs started with advisory host pressure warnings.")
+        warnings.append(f"Host pressure reasons observed: {'; '.join(host_pressure_reasons)}")
     if not run_payloads:
         warnings.append("No runs were recorded for this session.")
     return warnings
@@ -355,6 +405,11 @@ def _build_metric_summary(
 def _numeric_metric_value(run: Mapping[str, Any], metric_name: str, *, source: str) -> float | None:
     if source == "run":
         value = run.get(metric_name)
+    elif source == "system_snapshot":
+        system_snapshot = run.get("system_snapshot")
+        if not isinstance(system_snapshot, dict):
+            return None
+        value = system_snapshot.get(metric_name)
     else:
         metrics = run.get("metrics")
         if not isinstance(metrics, dict):
@@ -362,14 +417,37 @@ def _numeric_metric_value(run: Mapping[str, Any], metric_name: str, *, source: s
         value = metrics.get(metric_name)
         if metric_name == "generation_tokens_per_second" and not isinstance(value, (int, float)):
             value = metrics.get("tokens_per_second")
-    if not isinstance(value, (int, float)):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def _summary_metric_source(metric_name: str) -> str:
+    if metric_name == "elapsed_ms":
+        return "run"
+    if metric_name in {"available_system_memory_mb", "system_cpu_load_snapshot"}:
+        return "system_snapshot"
+    return "metrics"
 
 
 def _metric_bool(run: Mapping[str, Any], metric_name: str) -> bool:
     metrics = run.get("metrics")
     return isinstance(metrics, dict) and bool(metrics.get(metric_name))
+
+
+def _host_pressure_warning_reasons(run_payloads: Sequence[Mapping[str, Any]]) -> list[str]:
+    reasons: set[str] = set()
+    for run in run_payloads:
+        system_snapshot = run.get("system_snapshot")
+        if not isinstance(system_snapshot, dict):
+            continue
+        if not system_snapshot.get("host_pressure_warning"):
+            continue
+        raw_reasons = system_snapshot.get("host_pressure_warning_reasons")
+        if not isinstance(raw_reasons, list):
+            continue
+        reasons.update(reason for reason in raw_reasons if isinstance(reason, str) and reason)
+    return sorted(reasons)
 
 
 def _round_metric(value: float) -> float:
@@ -386,9 +464,10 @@ def _format_metric_headline(metrics: Mapping[str, Any], metric_name: str) -> str
     sample_size = metrics.get(f"{metric_name}_sample_size")
     median_value = metrics.get(f"{metric_name}_median")
     p95_value = metrics.get(f"{metric_name}_p95")
+    display_name = SUMMARY_METRIC_DISPLAY_NAMES.get(metric_name, metric_name)
     if not sample_size:
-        return f"{metric_name} unavailable."
-    return f"{metric_name} median {median_value}, p95 {p95_value} (n={sample_size})."
+        return f"{display_name} unavailable."
+    return f"{display_name} median {median_value}, p95 {p95_value} (n={sample_size})."
 
 
 def _optional_str(value: object) -> str | None:

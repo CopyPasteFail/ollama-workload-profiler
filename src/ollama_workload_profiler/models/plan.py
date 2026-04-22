@@ -18,6 +18,7 @@ class BenchmarkType(StrEnum):
     USE_CASE_PROFILES = "use-case-profiles"
     TTFT = "ttft"
     STRESS = "stress"
+    CONCURRENCY_SMOKE = "concurrency-smoke"
 
 
 class BenchmarkSessionPlan(BaseModel):

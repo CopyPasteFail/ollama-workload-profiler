@@ -24,7 +24,12 @@ from ollama_workload_profiler.benchmarks import (
     resolve_benchmark_family,
 )
 from ollama_workload_profiler.metrics.process import find_ollama_processes
-from ollama_workload_profiler.metrics.sampler import PollingProcessSampler, SamplePoint
+from ollama_workload_profiler.metrics.gpu import ExternalGpuTelemetryCollector
+from ollama_workload_profiler.metrics.sampler import (
+    PollingProcessSampler,
+    SamplePoint,
+    _is_missing_gpu_backend_sample,
+)
 from ollama_workload_profiler.metrics.phases import compute_phase_peaks
 from ollama_workload_profiler.prompts.fixtures import (
     MULTI_TURN_CHAT_TURNS,
@@ -40,6 +45,8 @@ from ollama_workload_profiler.prompts.scenarios import (
 from ollama_workload_profiler.session import (
     TerminalProgressReporter,
     _OllamaDispatcher,
+    _build_concurrency_aggregate_metrics,
+    _build_run_system_snapshot,
     _response_metrics,
     _requested_repetitions,
     build_profile_session_plan,
@@ -198,7 +205,7 @@ def test_summarize_session_budget_uses_execution_settings_repetitions() -> None:
     budget = summarize_session_budget(plan)
 
     assert budget["repetitions"] == 4
-    assert budget["run_count"] == 12
+    assert budget["run_count"] == 16
 
 
 def test_expand_session_plan_keeps_run_ids_unique_for_repeated_contexts() -> None:
@@ -765,8 +772,12 @@ def test_run_profile_session_records_host_metadata_and_per_run_system_snapshot(
         "ollama_workload_profiler.session._build_run_system_snapshot",
         lambda: {
             "cpu_percent": 21.5,
+            "system_cpu_load_snapshot": 21.5,
             "memory_available_mb": 24000.0,
+            "available_system_memory_mb": 24000.0,
             "memory_used_percent": 26.8,
+            "host_pressure_warning": False,
+            "host_pressure_warning_reasons": [],
             "ollama_process_count": 2,
         },
     )
@@ -789,10 +800,56 @@ def test_run_profile_session_records_host_metadata_and_per_run_system_snapshot(
     ]
     assert raw_rows[0]["system_snapshot"] == {
         "cpu_percent": 21.5,
+        "system_cpu_load_snapshot": 21.5,
         "memory_available_mb": 24000.0,
+        "available_system_memory_mb": 24000.0,
         "memory_used_percent": 26.8,
+        "host_pressure_warning": False,
+        "host_pressure_warning_reasons": [],
         "ollama_process_count": 2,
     }
+
+
+def test_build_run_system_snapshot_records_host_pressure_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeVirtualMemory:
+        available = 768 * 1024 * 1024
+        percent = 91.5
+
+    monkeypatch.setattr("ollama_workload_profiler.session._safe_virtual_memory", lambda: FakeVirtualMemory())
+    monkeypatch.setattr("ollama_workload_profiler.session._safe_cpu_percent", lambda: 87.5)
+    monkeypatch.setattr("ollama_workload_profiler.session.find_ollama_processes", lambda: [])
+
+    snapshot = _build_run_system_snapshot()
+
+    assert snapshot["available_system_memory_mb"] == 768.0
+    assert snapshot["system_cpu_load_snapshot"] == 87.5
+    assert snapshot["host_pressure_warning"] is True
+    assert snapshot["host_pressure_warning_reasons"] == [
+        "system_cpu_load_snapshot >= 80%",
+        "memory_used_percent >= 90%",
+        "available_system_memory_mb < 1024",
+    ]
+
+
+def test_build_run_system_snapshot_keeps_host_pressure_best_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_process_discovery() -> list[object]:
+        raise RuntimeError("process table unavailable")
+
+    monkeypatch.setattr("ollama_workload_profiler.session._safe_virtual_memory", lambda: None)
+    monkeypatch.setattr("ollama_workload_profiler.session._safe_cpu_percent", lambda: None)
+    monkeypatch.setattr("ollama_workload_profiler.session.find_ollama_processes", fail_process_discovery)
+
+    snapshot = _build_run_system_snapshot()
+
+    assert snapshot["available_system_memory_mb"] is None
+    assert snapshot["system_cpu_load_snapshot"] is None
+    assert snapshot["host_pressure_warning"] is False
+    assert snapshot["host_pressure_warning_reasons"] == []
+    assert snapshot["ollama_process_count"] is None
 
 
 def test_run_profile_session_persists_phase_peaks_from_real_sampler(
@@ -941,13 +998,15 @@ def test_run_profile_session_notifies_progress_reporter_for_each_run(
     )
 
     assert progress_events == [
-        ("start", 1, 3, "smoke", "Smoke sanity check", 4096, 1),
-        ("finish", 1, 3, "completed"),
-        ("start", 2, 3, "ttft", "TTFT probe", 4096, 1),
-        ("finish", 2, 3, "completed"),
-        ("start", 3, 3, "ttft", "TTFT chat probe", 4096, 1),
-        ("finish", 3, 3, "completed"),
-        ("session", 3, 3, 0),
+        ("start", 1, 4, "smoke", "Smoke sanity check", 4096, 1),
+        ("finish", 1, 4, "completed"),
+        ("start", 2, 4, "ttft", "TTFT probe", 4096, 1),
+        ("finish", 2, 4, "completed"),
+        ("start", 3, 4, "ttft", "TTFT chat probe", 4096, 1),
+        ("finish", 3, 4, "completed"),
+        ("start", 4, 4, "ttft", "TTFT stream-shape probe", 4096, 1),
+        ("finish", 4, 4, "completed"),
+        ("session", 4, 4, 0),
     ]
 
 
@@ -1150,6 +1209,69 @@ def test_compute_phase_peaks_breaks_rss_ties_by_higher_cpu_percent() -> None:
     assert peaks["generation"].cpu_percent == 35
 
 
+def test_external_gpu_telemetry_collector_parses_nvidia_smi_multi_gpu_output() -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str]) -> str:
+        commands.append(command)
+        return "1024, 40\n2048, 80\n"
+
+    collector = ExternalGpuTelemetryCollector(
+        executable_finder=lambda name: f"C:/bin/{name}.exe" if name == "nvidia-smi" else None,
+        command_runner=fake_run,
+    )
+
+    sample = collector.sample()
+
+    assert commands == [
+        [
+            "C:/bin/nvidia-smi.exe",
+            "--query-gpu=memory.used,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+    ]
+    assert sample.available is True
+    assert sample.source == "nvidia-smi"
+    assert sample.memory_used_mb == 3072.0
+    assert sample.util_percent == 60.0
+    assert sample.device_count == 2
+    assert sample.notes == ["multi_gpu_memory_summed_util_averaged"]
+
+
+def test_external_gpu_telemetry_collector_reports_unavailable_without_running_command() -> None:
+    collector = ExternalGpuTelemetryCollector(
+        executable_finder=lambda _name: None,
+        command_runner=lambda _command: "should not run",
+    )
+
+    sample = collector.sample()
+
+    assert sample.available is False
+    assert sample.source is None
+    assert sample.memory_used_mb is None
+    assert sample.util_percent is None
+    assert sample.device_count == 0
+    assert sample.notes == ["nvidia-smi not found; rocm-smi and Apple Silicon live GPU telemetry are not supported yet"]
+
+
+def test_external_gpu_telemetry_collector_treats_command_failures_as_unavailable() -> None:
+    def failing_run(_command: list[str]) -> str:
+        raise RuntimeError("nvidia-smi failed")
+
+    collector = ExternalGpuTelemetryCollector(
+        executable_finder=lambda name: name if name == "nvidia-smi" else None,
+        command_runner=failing_run,
+    )
+
+    sample = collector.sample()
+
+    assert sample.available is False
+    assert sample.source == "nvidia-smi"
+    assert sample.error == "nvidia-smi failed"
+    assert sample.memory_used_mb is None
+    assert sample.util_percent is None
+
+
 @pytest.mark.parametrize(
     "sample",
     [
@@ -1167,21 +1289,63 @@ def test_compute_phase_peaks_rejects_malformed_telemetry(sample: dict[str, objec
 
 def test_find_ollama_processes_filters_process_names_case_insensitively(monkeypatch: pytest.MonkeyPatch) -> None:
     class FakeProcess:
-        def __init__(self, name: str) -> None:
-            self.info = {"name": name}
+        def __init__(self, name: str, pid: int, ppid: int | None = None) -> None:
+            self.info = {"name": name, "pid": pid, "ppid": ppid}
 
     monkeypatch.setattr(
         "ollama_workload_profiler.metrics.process.psutil.process_iter",
         lambda attrs: [
-            FakeProcess("ollama"),
-            FakeProcess("Ollama-helper"),
-            FakeProcess("python"),
+            FakeProcess("ollama", 10),
+            FakeProcess("Ollama-helper", 11),
+            FakeProcess("python", 12),
         ],
     )
 
     processes = find_ollama_processes()
 
     assert [process.info["name"] for process in processes] == ["ollama", "Ollama-helper"]
+
+
+def test_find_ollama_processes_includes_descendants_of_ollama_roots(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeProcess:
+        def __init__(self, name: str, pid: int, ppid: int | None = None) -> None:
+            self.info = {"name": name, "pid": pid, "ppid": ppid}
+
+    monkeypatch.setattr(
+        "ollama_workload_profiler.metrics.process.psutil.process_iter",
+        lambda attrs: [
+            FakeProcess("ollama", 10, 1),
+            FakeProcess("runner", 20, 10),
+            FakeProcess("worker", 30, 20),
+            FakeProcess("unrelated", 40, 1),
+        ],
+    )
+
+    processes = find_ollama_processes()
+
+    assert [process.info["pid"] for process in processes] == [10, 20, 30]
+
+
+def test_find_ollama_processes_falls_back_to_roots_when_parent_metadata_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeProcess:
+        def __init__(self, name: str, pid: int | None = None) -> None:
+            self.info = {"name": name}
+            if pid is not None:
+                self.info["pid"] = pid
+
+    monkeypatch.setattr(
+        "ollama_workload_profiler.metrics.process.psutil.process_iter",
+        lambda attrs: [
+            FakeProcess("ollama", 10),
+            FakeProcess("python"),
+        ],
+    )
+
+    processes = find_ollama_processes()
+
+    assert [process.info["name"] for process in processes] == ["ollama"]
 
 
 def test_polling_process_sampler_collects_load_generation_and_post_run_samples() -> None:
@@ -1226,6 +1390,262 @@ def test_polling_process_sampler_collects_load_generation_and_post_run_samples()
     assert any(sample.phase == "generation" for sample in samples)
     assert all(sample.rss_mb == 256.0 for sample in samples)
     assert all(sample.cpu_percent == 12.5 for sample in samples)
+
+
+def test_polling_process_sampler_records_sampled_process_metadata() -> None:
+    class FakeMemoryInfo:
+        def __init__(self, rss: int) -> None:
+            self.rss = rss
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.info = {"pid": pid}
+
+        def memory_info(self) -> FakeMemoryInfo:
+            return FakeMemoryInfo(32 * 1024 * 1024)
+
+        def cpu_percent(self, interval: float | None = None) -> float:
+            return 5.0
+
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [FakeProcess(10), FakeProcess(20)],
+    )
+
+    sample = sampler._snapshot_sample("generation")
+
+    assert sample.sampled_process_count == 2
+    assert sample.sampled_process_ids == [10, 20]
+    assert sample.rss_mb == 64.0
+    assert sample.cpu_percent == 10.0
+
+
+def test_polling_process_sampler_counts_unique_sampled_process_ids() -> None:
+    class FakeMemoryInfo:
+        def __init__(self, rss: int) -> None:
+            self.rss = rss
+
+    class FakeProcess:
+        def __init__(self, pid: int) -> None:
+            self.info = {"pid": pid}
+
+        def memory_info(self) -> FakeMemoryInfo:
+            return FakeMemoryInfo(32 * 1024 * 1024)
+
+        def cpu_percent(self, interval: float | None = None) -> float:
+            return 5.0
+
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [FakeProcess(10), FakeProcess(10), FakeProcess(20)],
+    )
+
+    sample = sampler._snapshot_sample("generation")
+
+    assert sample.sampled_process_ids == [10, 20]
+    assert sample.sampled_process_count == len(sample.sampled_process_ids)
+
+
+def test_polling_process_sampler_includes_best_effort_gpu_samples() -> None:
+    class FakeMemoryInfo:
+        def __init__(self, rss: int) -> None:
+            self.rss = rss
+
+    class FakeProcess:
+        def memory_info(self) -> FakeMemoryInfo:
+            return FakeMemoryInfo(64 * 1024 * 1024)
+
+        def cpu_percent(self, interval: float | None = None) -> float:
+            return 10.0
+
+    class FakeGpuCollector:
+        def sample(self) -> object:
+            return type(
+                "GpuSample",
+                (),
+                {
+                    "available": True,
+                    "source": "nvidia-smi",
+                    "memory_used_mb": 2048.0,
+                    "util_percent": 55.0,
+                    "device_count": 1,
+                    "notes": [],
+                    "error": None,
+                },
+            )()
+
+    planned_run = PlannedRun(
+        run_id="run-sampler-gpu",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+        scenario_version="v1",
+    )
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [FakeProcess()],
+        gpu_collector=FakeGpuCollector(),
+        interval_seconds=0.001,
+        shutdown_timeout_seconds=0.5,
+    )
+
+    sampler.start(planned_run)
+    time.sleep(0.01)
+    samples = sampler.stop()
+
+    assert any(sample.gpu_telemetry_available for sample in samples)
+    assert max(sample.gpu_memory_used_mb or 0 for sample in samples) == 2048.0
+    assert max(sample.gpu_util_percent or 0 for sample in samples) == 55.0
+
+
+def test_polling_process_sampler_reuses_cached_gpu_sample_between_gpu_poll_intervals() -> None:
+    class FakeGpuCollector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> object:
+            self.calls += 1
+            return type(
+                "GpuSample",
+                (),
+                {
+                    "available": True,
+                    "source": "nvidia-smi",
+                    "memory_used_mb": 1024.0 + self.calls,
+                    "util_percent": 10.0 + self.calls,
+                    "device_count": 1,
+                    "notes": [],
+                    "error": None,
+                },
+            )()
+
+    now = 100.0
+    collector = FakeGpuCollector()
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [],
+        gpu_collector=collector,
+        interval_seconds=0.001,
+        gpu_poll_interval_seconds=1.0,
+        clock=lambda: now,
+    )
+
+    first = sampler._snapshot_sample("load")
+    second = sampler._snapshot_sample("generation")
+
+    assert collector.calls == 1
+    assert first.gpu_memory_used_mb == 1025.0
+    assert second.gpu_memory_used_mb == 1025.0
+
+
+def test_polling_process_sampler_caches_missing_gpu_backend_for_the_run() -> None:
+    class FakeGpuCollector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> object:
+            self.calls += 1
+            return type(
+                "GpuSample",
+                (),
+                {
+                    "available": False,
+                    "source": None,
+                    "memory_used_mb": None,
+                    "util_percent": None,
+                    "device_count": 0,
+                    "notes": ["nvidia-smi not found"],
+                    "error": None,
+                },
+            )()
+
+    now = 100.0
+    collector = FakeGpuCollector()
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [],
+        gpu_collector=collector,
+        gpu_poll_interval_seconds=0.5,
+        clock=lambda: now,
+    )
+
+    first = sampler._snapshot_sample("load")
+    now = 200.0
+    second = sampler._snapshot_sample("generation")
+
+    assert collector.calls == 1
+    assert first.gpu_telemetry_available is False
+    assert second.gpu_telemetry_available is False
+    assert second.gpu_telemetry_notes == ["nvidia-smi not found"]
+
+
+def test_missing_gpu_backend_cache_uses_named_internal_signal() -> None:
+    assert _is_missing_gpu_backend_sample(
+        type(
+            "GpuSample",
+            (),
+            {
+                "available": False,
+                "source": None,
+                "error": None,
+            },
+        )()
+    )
+    assert not _is_missing_gpu_backend_sample(
+        type(
+            "GpuSample",
+            (),
+            {
+                "available": False,
+                "source": "nvidia-smi",
+                "error": "command failed",
+            },
+        )()
+    )
+
+
+def test_polling_process_sampler_retries_failed_gpu_command_only_after_gpu_poll_interval() -> None:
+    class FakeGpuCollector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def sample(self) -> object:
+            self.calls += 1
+            return type(
+                "GpuSample",
+                (),
+                {
+                    "available": False,
+                    "source": "nvidia-smi",
+                    "memory_used_mb": None,
+                    "util_percent": None,
+                    "device_count": 0,
+                    "notes": [],
+                    "error": f"failed-{self.calls}",
+                },
+            )()
+
+    now = 100.0
+    collector = FakeGpuCollector()
+    sampler = PollingProcessSampler(
+        process_finder=lambda: [],
+        gpu_collector=collector,
+        gpu_poll_interval_seconds=0.5,
+        clock=lambda: now,
+    )
+
+    first = sampler._snapshot_sample("load")
+    now = 100.25
+    second = sampler._snapshot_sample("generation")
+    now = 100.51
+    third = sampler._snapshot_sample("generation")
+
+    assert collector.calls == 2
+    assert first.gpu_telemetry_error == "failed-1"
+    assert second.gpu_telemetry_error == "failed-1"
+    assert third.gpu_telemetry_error == "failed-2"
 
 
 def test_polling_process_sampler_waits_for_in_flight_poll_before_stop_returns() -> None:
@@ -1449,23 +1869,32 @@ def test_use_case_profiles_use_deterministic_fixtures() -> None:
 def test_benchmark_family_resolution_keeps_ttft_as_distinct_execution_mode() -> None:
     smoke_family = resolve_benchmark_family(BenchmarkType.SMOKE)
     ttft_family = resolve_benchmark_family(BenchmarkType.TTFT)
+    concurrency_family = resolve_benchmark_family(BenchmarkType.CONCURRENCY_SMOKE)
 
     smoke_scenarios = build_benchmark_scenarios(BenchmarkType.SMOKE, 4096)
     ttft_scenarios = build_benchmark_scenarios(BenchmarkType.TTFT, 4096)
+    concurrency_scenarios = build_benchmark_scenarios(BenchmarkType.CONCURRENCY_SMOKE, 4096)
 
     assert smoke_family.execution_mode is ExecutionMode.GENERATE
     assert ttft_family.execution_mode is ExecutionMode.TTFT
+    assert concurrency_family.execution_mode is ExecutionMode.CONCURRENCY
     assert smoke_scenarios[0].scenario_id == "smoke-basic-v1"
     assert ttft_scenarios[0].scenario_id == "ttft-basic-v1"
+    assert [scenario.parallelism for scenario in concurrency_scenarios] == [2, 4]
 
 
-def test_ttft_family_builds_two_deterministic_scenarios() -> None:
+def test_ttft_family_builds_three_deterministic_scenarios() -> None:
     scenarios = build_benchmark_scenarios(BenchmarkType.TTFT, 4096)
 
     assert [scenario.scenario_id for scenario in scenarios] == [
         "ttft-basic-v1",
         "ttft-chat-v1",
+        "ttft-stream-shape-v1",
     ]
+    stream_shape = scenarios[2]
+    assert stream_shape.target_output_tokens == 32
+    assert isinstance(stream_shape.prompt_payload, TextPromptPayload)
+    assert "four short labeled lines" in stream_shape.prompt_payload.text
 
 
 def test_stress_family_builds_two_deterministic_scenarios() -> None:
@@ -1482,6 +1911,17 @@ def test_output_scaling_long_scenario_uses_release_target_band() -> None:
     long_scenario = next(scenario for scenario in scenarios if scenario.scenario_id == "output-scaling-long-v1")
 
     assert long_scenario.target_output_tokens == 768
+
+
+def test_concurrency_smoke_family_defines_small_parallelism_values() -> None:
+    scenarios = build_benchmark_scenarios(BenchmarkType.CONCURRENCY_SMOKE, 4096)
+
+    assert [scenario.scenario_id for scenario in scenarios] == [
+        "concurrency-smoke-p2-v1",
+        "concurrency-smoke-p4-v1",
+    ]
+    assert [scenario.parallelism for scenario in scenarios] == [2, 4]
+    assert all(scenario.target_output_tokens == 32 for scenario in scenarios)
 
 
 def test_context_scaling_scenarios_declare_calibration_metadata() -> None:
@@ -1533,7 +1973,7 @@ def test_ollama_dispatcher_uses_stream_generate_for_ttft_and_measures_first_toke
                 {"response": "ok", "done": True, "eval_count": 4, "eval_duration": 250_000},
             ]
 
-    perf_values = iter([10.0, 10.05, 10.2])
+    perf_values = iter([10.0, 10.05, 10.2, 10.25])
     monkeypatch.setattr("ollama_workload_profiler.session.perf_counter", lambda: next(perf_values))
 
     result = _OllamaDispatcher(FakeClient()).execute(
@@ -1547,7 +1987,247 @@ def test_ollama_dispatcher_uses_stream_generate_for_ttft_and_measures_first_toke
 
     assert result.metrics["ttft_ms"] == 50.0
     assert result.metrics["ttft_first_token_received"] is True
+    assert result.metrics["stream_emission_count"] == 2
+    assert result.metrics["stream_emission_offsets_ms"] == [50.0, 200.0]
+    assert result.metrics["stream_duration_ms"] == 150.0
+    assert result.metrics["stream_emission_interval_ms_median"] == 150.0
+    assert result.metrics["stream_emission_interval_ms_p95"] == 150.0
+    assert result.metrics["stream_output_units_per_second"] == 13.333
+    assert result.metrics["stream_output_unit"] == "emission"
     assert result.metrics["tokens_per_second"] == 16000.0
+
+
+def test_ollama_dispatcher_uses_emission_chunks_for_stream_shape_when_token_timing_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planned_run = PlannedRun(
+        run_id="run-ttft-stream-shape",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.TTFT,
+        benchmark_type_index=1,
+        scenario_id="ttft-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="TTFT probe",
+        scenario_version="v1",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.TTFT, 4096)[0]
+
+    class FakeClient:
+        def stream_generate(self, *, model: str, prompt: str, options: dict[str, object]) -> list[dict[str, object]]:
+            return [
+                {"response": "", "done": False},
+                {"response": "a", "done": False},
+                {"thinking": "b", "done": False},
+                {"response": "", "done": False},
+                {"response": "c", "done": True, "eval_count": 3, "eval_duration": 300_000},
+            ]
+
+    perf_values = iter([100.0, 100.01, 100.04, 100.11, 100.2])
+    monkeypatch.setattr("ollama_workload_profiler.session.perf_counter", lambda: next(perf_values))
+
+    result = _OllamaDispatcher(FakeClient()).execute(
+        ExecutionRequest(
+            run=planned_run,
+            scenario=scenario,
+            execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
+        )
+    )
+
+    assert result.metrics["ttft_ms"] == 10.0
+    assert result.metrics["stream_emission_count"] == 3
+    assert result.metrics["stream_emission_offsets_ms"] == [10.0, 40.0, 110.0]
+    assert result.metrics["stream_duration_ms"] == 100.0
+    assert result.metrics["stream_emission_interval_ms_median"] == 50.0
+    assert result.metrics["stream_emission_interval_ms_p95"] == 70.0
+    assert result.metrics["stream_output_units_per_second"] == 30.0
+    assert result.metrics["stream_output_unit"] == "emission"
+
+
+def test_ollama_dispatcher_sets_interval_metrics_to_none_for_single_stream_emission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    planned_run = PlannedRun(
+        run_id="run-ttft-single-emission",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.TTFT,
+        benchmark_type_index=1,
+        scenario_id="ttft-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="TTFT probe",
+        scenario_version="v1",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.TTFT, 4096)[0]
+
+    class FakeClient:
+        def stream_generate(self, *, model: str, prompt: str, options: dict[str, object]) -> list[dict[str, object]]:
+            return [{"response": "only", "done": True}]
+
+    perf_values = iter([200.0, 200.025, 200.05])
+    monkeypatch.setattr("ollama_workload_profiler.session.perf_counter", lambda: next(perf_values))
+
+    result = _OllamaDispatcher(FakeClient()).execute(
+        ExecutionRequest(
+            run=planned_run,
+            scenario=scenario,
+            execution_mode=ExecutionMode.TTFT,
+            execution_settings={"seed": 1234, "temperature": 0.2},
+        )
+    )
+
+    assert result.metrics["stream_emission_count"] == 1
+    assert result.metrics["stream_emission_offsets_ms"] == [25.0]
+    assert result.metrics["stream_duration_ms"] == 0.0
+    assert result.metrics["stream_emission_interval_ms_median"] is None
+    assert result.metrics["stream_emission_interval_ms_p95"] is None
+    assert result.metrics["stream_output_units_per_second"] is None
+
+
+def test_concurrency_aggregate_metrics_report_request_elapsed_percentiles() -> None:
+    metrics = _build_concurrency_aggregate_metrics(
+        [
+            {"request_index": 1, "elapsed_ms": 100.0, "ttft_ms": 10.0},
+            {"request_index": 2, "elapsed_ms": 200.0, "ttft_ms": 20.0},
+            {"request_index": 3, "elapsed_ms": 300.0, "ttft_ms": None},
+            {"request_index": 4, "elapsed_ms": 400.0, "ttft_ms": 40.0},
+        ]
+    )
+
+    assert metrics["concurrency_request_elapsed_ms_p50"] == 250.0
+    assert metrics["concurrency_request_elapsed_ms_p95"] == 400.0
+    assert metrics["concurrency_request_ttft_ms_p50"] == 20.0
+    assert metrics["concurrency_request_ttft_ms_p95"] == 40.0
+
+
+def test_ollama_dispatcher_runs_concurrency_smoke_as_parallel_streams() -> None:
+    planned_run = PlannedRun(
+        run_id="run-concurrency-smoke",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.CONCURRENCY_SMOKE,
+        benchmark_type_index=1,
+        scenario_id="concurrency-smoke-p2-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Concurrency smoke p=2",
+        scenario_version="v1",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONCURRENCY_SMOKE, 4096)[0]
+
+    class FakeWorkerClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def stream_generate(self, *, model: str, prompt: str, options: dict[str, object]) -> list[dict[str, object]]:
+            self.calls.append({"model": model, "prompt": prompt, "options": options})
+            return [
+                {"response": "ok", "done": False},
+                {"response": "done", "done": True, "eval_count": 2, "eval_duration": 250_000},
+            ]
+
+    worker_clients: list[FakeWorkerClient] = []
+
+    def worker_client_factory() -> FakeWorkerClient:
+        client = FakeWorkerClient()
+        worker_clients.append(client)
+        return client
+
+    result = _OllamaDispatcher(
+        object(),
+        concurrency_client_factory=worker_client_factory,
+    ).execute(
+        ExecutionRequest(
+            run=planned_run,
+            scenario=scenario,
+            execution_mode=ExecutionMode.CONCURRENCY,
+            execution_settings={"seed": 1234, "temperature": 0.2},
+        )
+    )
+
+    assert sum(len(client.calls) for client in worker_clients) == 2
+    assert result.metrics["concurrency_parallelism"] == 2
+    assert result.metrics["concurrency_mode"] == "same_machine_threaded_streams"
+    assert result.metrics["concurrency_request_count"] == 2
+    assert len(result.metrics["concurrency_requests"]) == 2
+    assert all(
+        request["ttft_ms"] is not None
+        and request["elapsed_ms"] is not None
+        and request["stream_emission_count"] == 2
+        for request in result.metrics["concurrency_requests"]
+    )
+    assert result.metrics["concurrency_request_elapsed_ms_p50"] is not None
+    assert result.metrics["concurrency_request_elapsed_ms_p95"] is not None
+    assert result.metrics["concurrency_request_ttft_ms_p50"] is not None
+    assert result.metrics["concurrency_request_ttft_ms_p95"] is not None
+
+
+def test_ollama_dispatcher_uses_fresh_worker_clients_for_concurrency_smoke() -> None:
+    planned_run = PlannedRun(
+        run_id="run-concurrency-worker-clients",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.CONCURRENCY_SMOKE,
+        benchmark_type_index=1,
+        scenario_id="concurrency-smoke-p2-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Concurrency smoke p=2",
+        scenario_version="v1",
+    )
+    scenario = build_benchmark_scenarios(BenchmarkType.CONCURRENCY_SMOKE, 4096)[0]
+
+    class SharedClient:
+        def stream_generate(self, **_: object) -> list[dict[str, object]]:
+            raise AssertionError("concurrency path must not use the shared dispatcher client")
+
+    class WorkerClient:
+        def __init__(self, worker_id: int) -> None:
+            self.worker_id = worker_id
+            self.closed = False
+
+        def stream_generate(self, *, model: str, prompt: str, options: dict[str, object]) -> list[dict[str, object]]:
+            return [
+                {"response": f"worker-{self.worker_id}", "done": False},
+                {"response": "done", "done": True},
+            ]
+
+        def close(self) -> None:
+            self.closed = True
+
+    created_clients: list[WorkerClient] = []
+
+    def worker_client_factory() -> WorkerClient:
+        client = WorkerClient(len(created_clients) + 1)
+        created_clients.append(client)
+        return client
+
+    result = _OllamaDispatcher(
+        SharedClient(),
+        concurrency_client_factory=worker_client_factory,
+    ).execute(
+        ExecutionRequest(
+            run=planned_run,
+            scenario=scenario,
+            execution_mode=ExecutionMode.CONCURRENCY,
+            execution_settings={"seed": 1234, "temperature": 0.2},
+        )
+    )
+
+    assert len(created_clients) == 2
+    assert all(client.closed for client in created_clients)
+    assert result.metrics["concurrency_request_count"] == 2
 
 
 def test_response_metrics_extracts_load_and_prompt_generation_throughput() -> None:
@@ -2180,6 +2860,12 @@ def test_ollama_dispatcher_records_missing_first_token_for_empty_ttft_stream(
 
     assert "ttft_ms" not in result.metrics
     assert result.metrics["ttft_first_token_received"] is False
+    assert result.metrics["stream_emission_count"] == 0
+    assert result.metrics["stream_emission_offsets_ms"] == []
+    assert result.metrics["stream_duration_ms"] is None
+    assert result.metrics["stream_emission_interval_ms_median"] is None
+    assert result.metrics["stream_emission_interval_ms_p95"] is None
+    assert result.metrics["stream_output_units_per_second"] is None
     assert result.elapsed_ms == 100.0
 
 
@@ -2332,6 +3018,215 @@ def test_benchmark_runner_finalizes_completed_run_from_execution_facts() -> None
     assert result.elapsed_ms == 42.5
     assert result.metrics["tokens_per_second"] == 12.0
     assert result.metrics["phase_peaks"]["generation"]["rss_mb"] == 128.0
+
+
+def test_benchmark_runner_adds_best_effort_gpu_summary_from_sampler_samples() -> None:
+    planned_run = PlannedRun(
+        run_id="run-gpu-summary",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return [
+                SamplePoint(
+                    phase="load",
+                    rss_mb=100.0,
+                    cpu_percent=10.0,
+                    gpu_telemetry_available=True,
+                    gpu_telemetry_source="nvidia-smi",
+                    gpu_memory_used_mb=1024.0,
+                    gpu_util_percent=20.0,
+                    gpu_device_count=1,
+                    gpu_telemetry_notes=[],
+                ),
+                SamplePoint(
+                    phase="generation",
+                    rss_mb=120.0,
+                    cpu_percent=30.0,
+                    gpu_telemetry_available=True,
+                    gpu_telemetry_source="nvidia-smi",
+                    gpu_memory_used_mb=1536.0,
+                    gpu_util_percent=80.0,
+                    gpu_device_count=1,
+                    gpu_telemetry_notes=[],
+                ),
+            ]
+
+    class FakeDispatcher:
+        def execute(self, request: object) -> ExecutionResult:
+            return ExecutionResult(elapsed_ms=42.5, metrics={})
+
+    runner = BenchmarkRunner(dispatcher=FakeDispatcher(), sampler_factory=FakeSampler)
+
+    result = runner.run(planned_run)
+
+    assert result.metrics["gpu_telemetry_available"] is True
+    assert result.metrics["gpu_telemetry_source"] == "nvidia-smi"
+    assert result.metrics["gpu_backend"] == "nvidia-smi"
+    assert result.metrics["peak_gpu_memory_mb"] == 1536.0
+    assert result.metrics["avg_gpu_util_percent"] == 50.0
+    assert result.metrics["peak_gpu_util_percent"] == 80.0
+    assert result.metrics["gpu_device_count"] == 1
+
+
+def test_benchmark_runner_adds_sampled_process_summary_from_sampler_samples() -> None:
+    planned_run = PlannedRun(
+        run_id="run-process-summary",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return [
+                SamplePoint(
+                    phase="load",
+                    rss_mb=100.0,
+                    cpu_percent=10.0,
+                    sampled_process_count=1,
+                    sampled_process_ids=[10],
+                ),
+                SamplePoint(
+                    phase="generation",
+                    rss_mb=120.0,
+                    cpu_percent=30.0,
+                    sampled_process_count=3,
+                    sampled_process_ids=[10, 20, 30],
+                ),
+            ]
+
+    class FakeDispatcher:
+        def execute(self, request: object) -> ExecutionResult:
+            return ExecutionResult(elapsed_ms=42.5, metrics={})
+
+    runner = BenchmarkRunner(dispatcher=FakeDispatcher(), sampler_factory=FakeSampler)
+
+    result = runner.run(planned_run)
+
+    assert result.metrics["sampled_process_count"] == 3
+    assert result.metrics["sampled_process_ids"] == [10, 20, 30]
+
+
+def test_benchmark_runner_process_summary_count_matches_unique_sampled_process_ids() -> None:
+    planned_run = PlannedRun(
+        run_id="run-process-summary-dedup",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return [
+                SamplePoint(
+                    phase="load",
+                    rss_mb=100.0,
+                    cpu_percent=10.0,
+                    sampled_process_count=2,
+                    sampled_process_ids=[10, 10],
+                ),
+                SamplePoint(
+                    phase="generation",
+                    rss_mb=120.0,
+                    cpu_percent=30.0,
+                    sampled_process_count=2,
+                    sampled_process_ids=[10, 20],
+                ),
+            ]
+
+    class FakeDispatcher:
+        def execute(self, request: object) -> ExecutionResult:
+            return ExecutionResult(elapsed_ms=42.5, metrics={})
+
+    runner = BenchmarkRunner(dispatcher=FakeDispatcher(), sampler_factory=FakeSampler)
+
+    result = runner.run(planned_run)
+
+    assert result.metrics["sampled_process_ids"] == [10, 20]
+    assert result.metrics["sampled_process_count"] == len(result.metrics["sampled_process_ids"])
+
+
+def test_benchmark_runner_records_gpu_telemetry_unavailable_without_failing_run() -> None:
+    planned_run = PlannedRun(
+        run_id="run-gpu-unavailable",
+        run_index=1,
+        model_name="llama3.2",
+        context_size=4096,
+        context_index=1,
+        benchmark_type=BenchmarkType.SMOKE,
+        benchmark_type_index=1,
+        scenario_id="smoke-basic-v1",
+        scenario_index=1,
+        repetition_index=1,
+        scenario_name="Smoke sanity check",
+    )
+
+    class FakeSampler:
+        def start(self, run: PlannedRun) -> None:
+            assert run.run_id == planned_run.run_id
+
+        def stop(self) -> list[SamplePoint]:
+            return [
+                SamplePoint(
+                    phase="generation",
+                    rss_mb=120.0,
+                    cpu_percent=30.0,
+                    gpu_telemetry_available=False,
+                    gpu_telemetry_source=None,
+                    gpu_telemetry_notes=["nvidia-smi not found"],
+                )
+            ]
+
+    class FakeDispatcher:
+        def execute(self, request: object) -> ExecutionResult:
+            return ExecutionResult(elapsed_ms=42.5, metrics={})
+
+    runner = BenchmarkRunner(dispatcher=FakeDispatcher(), sampler_factory=FakeSampler)
+
+    result = runner.run(planned_run)
+
+    assert result.state is RunState.COMPLETED
+    assert result.metrics["gpu_telemetry_available"] is False
+    assert result.metrics["gpu_telemetry_source"] is None
+    assert result.metrics["gpu_backend"] is None
+    assert result.metrics["peak_gpu_memory_mb"] is None
+    assert result.metrics["avg_gpu_util_percent"] is None
+    assert result.metrics["peak_gpu_util_percent"] is None
+    assert result.metrics["gpu_telemetry_notes"] == ["nvidia-smi not found"]
 
 
 def test_benchmark_runner_uses_ttft_execution_mode_and_classifies_stopped_runs() -> None:

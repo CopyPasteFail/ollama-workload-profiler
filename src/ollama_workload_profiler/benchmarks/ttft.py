@@ -44,4 +44,17 @@ def build_scenarios(_context_size: int) -> list[ScenarioDefinition]:
             difficulty_tag="light",
             phase_emphasis="load_sensitive",
         ),
+        ScenarioDefinition(
+            scenario_id="ttft-stream-shape-v1",
+            benchmark_type=BenchmarkType.TTFT,
+            name="TTFT stream-shape probe",
+            version="v1",
+            prompt_payload=TextPromptPayload(
+                "Write exactly four short labeled lines, one per line, "
+                "using this format:\nA: red\nB: blue\nC: green\nD: gold"
+            ),
+            target_output_tokens=32,
+            difficulty_tag="light",
+            phase_emphasis="load_sensitive",
+        ),
     ]

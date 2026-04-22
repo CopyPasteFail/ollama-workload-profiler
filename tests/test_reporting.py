@@ -16,6 +16,7 @@ from ollama_workload_profiler.models.failures import FailureInfo
 from ollama_workload_profiler.models.summary import ReportSummary
 from ollama_workload_profiler.reporting.artifacts import write_session_artifacts
 from ollama_workload_profiler.reporting.markdown import render_markdown_report
+from ollama_workload_profiler.reporting.plots import export_summary_plots
 from ollama_workload_profiler.reporting.summary import build_report_summary
 
 
@@ -42,6 +43,60 @@ def test_write_session_artifacts_creates_fixed_filenames(tmp_path: Path) -> None
     assert (output_dir / "raw.csv").exists()
     assert (output_dir / "summary.json").exists()
     assert (output_dir / "report.md").exists()
+
+
+def test_export_summary_plots_writes_blog_friendly_svg_artifacts(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    (session_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "benchmark_summaries": [
+                    {
+                        "model_name": "llama3.2",
+                        "context_size": 4096,
+                        "benchmark_type": "prompt-scaling",
+                        "scenario_id": "prompt-scaling-small-v1",
+                        "strict_sample_size": 1,
+                        "prompt_eval_count_median": 1024.0,
+                        "ttft_ms_median": 80.0,
+                        "stream_emission_interval_ms_median_median": 18.0,
+                        "prompt_tokens_per_second_median": 2100.0,
+                        "generation_tokens_per_second_median": 52.0,
+                    },
+                    {
+                        "model_name": "llama3.2",
+                        "context_size": 4096,
+                        "benchmark_type": "prompt-scaling",
+                        "scenario_id": "prompt-scaling-large-v1",
+                        "strict_sample_size": 1,
+                        "prompt_eval_count_median": 4096.0,
+                        "ttft_ms_median": 140.0,
+                        "stream_emission_interval_ms_median_median": 26.0,
+                        "prompt_tokens_per_second_median": 1800.0,
+                        "generation_tokens_per_second_median": 48.0,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    written = export_summary_plots(session_dir)
+
+    assert [path.name for path in written] == [
+        "latency_vs_prompt_size.svg",
+        "throughput_vs_prompt_size.svg",
+        "README.md",
+    ]
+    latency_svg = (session_dir / "plots" / "latency_vs_prompt_size.svg").read_text(encoding="utf-8")
+    throughput_svg = (session_dir / "plots" / "throughput_vs_prompt_size.svg").read_text(encoding="utf-8")
+    note = (session_dir / "plots" / "README.md").read_text(encoding="utf-8")
+    assert "TTFT vs prompt size" in latency_svg
+    assert "Median stream emission interval" in latency_svg
+    assert "Prompt processing speed vs prompt size" in throughput_svg
+    assert "Generation speed" in throughput_svg
+    assert "prompt_eval_count_median" in note
 
 
 def test_write_session_artifacts_persists_execution_settings_as_requested_policy(tmp_path: Path) -> None:
@@ -97,11 +152,42 @@ def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(t
             elapsed_ms=12.5,
             system_snapshot={
                 "cpu_percent": 21.5,
+                "system_cpu_load_snapshot": 21.5,
                 "memory_available_mb": 24000.0,
+                "available_system_memory_mb": 24000.0,
+                "host_pressure_warning": True,
+                "host_pressure_warning_reasons": ["system_cpu_load_snapshot >= 80%"],
                 "ollama_process_count": 2,
             },
             metrics={
                 "tokens_per_second": 45.0,
+                "stream_emission_count": 3,
+                "stream_emission_offsets_ms": [12.0, 42.0, 92.0],
+                "stream_duration_ms": 80.0,
+                "stream_emission_interval_ms_median": 40.0,
+                "stream_emission_interval_ms_p95": 50.0,
+                "stream_output_units_per_second": 37.5,
+                "stream_output_unit": "emission",
+                "concurrency_parallelism": 2,
+                "concurrency_request_count": 2,
+                "concurrency_request_elapsed_ms_p50": 125.0,
+                "concurrency_request_elapsed_ms_p95": 150.0,
+                "concurrency_request_ttft_ms_p50": 20.0,
+                "concurrency_request_ttft_ms_p95": 25.0,
+                "concurrency_requests": [
+                    {"request_index": 1, "elapsed_ms": 100.0, "ttft_ms": 15.0},
+                    {"request_index": 2, "elapsed_ms": 150.0, "ttft_ms": 25.0},
+                ],
+                "gpu_telemetry_available": True,
+                "gpu_telemetry_source": "nvidia-smi",
+                "gpu_backend": "nvidia-smi",
+                "peak_gpu_memory_mb": 3072.0,
+                "avg_gpu_util_percent": 45.0,
+                "peak_gpu_util_percent": 70.0,
+                "gpu_device_count": 2,
+                "gpu_telemetry_notes": ["multi_gpu_memory_summed_util_averaged"],
+                "sampled_process_count": 3,
+                "sampled_process_ids": [10, 20, 30],
                 "phase_peaks": {"generation": {"rss_mb": 256.0, "cpu_percent": 65.0}},
             },
         )
@@ -124,7 +210,19 @@ def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(t
 
     raw_payload = json.loads(raw_lines[0])
     assert raw_payload["run_id"] == "run-0001"
+    assert raw_payload["metrics"]["stream_emission_offsets_ms"] == [12.0, 42.0, 92.0]
+    assert raw_payload["metrics"]["stream_output_unit"] == "emission"
+    assert raw_payload["metrics"]["concurrency_request_elapsed_ms_p50"] == 125.0
+    assert raw_payload["metrics"]["concurrency_requests"][0]["elapsed_ms"] == 100.0
+    assert raw_payload["metrics"]["gpu_telemetry_available"] is True
+    assert raw_payload["metrics"]["gpu_telemetry_source"] == "nvidia-smi"
+    assert raw_payload["metrics"]["gpu_telemetry_notes"] == ["multi_gpu_memory_summed_util_averaged"]
+    assert raw_payload["metrics"]["sampled_process_count"] == 3
+    assert raw_payload["metrics"]["sampled_process_ids"] == [10, 20, 30]
     assert raw_payload["metrics"]["phase_peaks"]["generation"]["rss_mb"] == 256.0
+    assert raw_payload["system_snapshot"]["available_system_memory_mb"] == 24000.0
+    assert raw_payload["system_snapshot"]["system_cpu_load_snapshot"] == 21.5
+    assert raw_payload["system_snapshot"]["host_pressure_warning"] is True
 
     with (output_dir / "raw.csv").open(encoding="utf-8", newline="") as handle:
         csv_rows = list(csv.DictReader(handle))
@@ -132,9 +230,98 @@ def test_write_session_artifacts_uses_raw_jsonl_as_source_of_truth_for_raw_csv(t
     assert len(csv_rows) == 1
     assert csv_rows[0]["run_id"] == raw_payload["run_id"]
     assert csv_rows[0]["metrics.tokens_per_second"] == "45.0"
+    assert csv_rows[0]["metrics.stream_emission_count"] == "3"
+    assert csv_rows[0]["metrics.stream_emission_offsets_ms"] == "[12.0, 42.0, 92.0]"
+    assert csv_rows[0]["metrics.stream_output_units_per_second"] == "37.5"
+    assert csv_rows[0]["metrics.stream_output_unit"] == "emission"
+    assert csv_rows[0]["metrics.concurrency_request_elapsed_ms_p50"] == "125.0"
+    assert csv_rows[0]["metrics.concurrency_request_elapsed_ms_p95"] == "150.0"
+    assert '"elapsed_ms": 100.0' in csv_rows[0]["metrics.concurrency_requests"]
+    assert csv_rows[0]["metrics.gpu_telemetry_available"] == "True"
+    assert csv_rows[0]["metrics.gpu_telemetry_source"] == "nvidia-smi"
+    assert csv_rows[0]["metrics.peak_gpu_memory_mb"] == "3072.0"
+    assert csv_rows[0]["metrics.avg_gpu_util_percent"] == "45.0"
+    assert csv_rows[0]["metrics.peak_gpu_util_percent"] == "70.0"
+    assert csv_rows[0]["metrics.sampled_process_count"] == "3"
+    assert csv_rows[0]["metrics.sampled_process_ids"] == "[10, 20, 30]"
     assert csv_rows[0]["metrics.phase_peaks.generation.rss_mb"] == "256.0"
     assert csv_rows[0]["system_snapshot.cpu_percent"] == "21.5"
     assert csv_rows[0]["system_snapshot.memory_available_mb"] == "24000.0"
+    assert csv_rows[0]["system_snapshot.available_system_memory_mb"] == "24000.0"
+    assert csv_rows[0]["system_snapshot.system_cpu_load_snapshot"] == "21.5"
+    assert csv_rows[0]["system_snapshot.host_pressure_warning"] == "True"
+
+
+def test_report_summary_surfaces_host_pressure_context_and_warnings() -> None:
+    runs = [
+        RunResult(
+            run_id="run-0001",
+            run_index=1,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.SMOKE,
+            benchmark_type_index=1,
+            scenario_id="smoke-basic-v1",
+            scenario_index=1,
+            state=RunState.COMPLETED,
+            elapsed_ms=12.5,
+            system_snapshot={
+                "available_system_memory_mb": 768.0,
+                "system_cpu_load_snapshot": 87.5,
+                "host_pressure_warning": True,
+                "host_pressure_warning_reasons": [
+                    "system_cpu_load_snapshot >= 80%",
+                    "available_system_memory_mb < 1024",
+                ],
+            },
+            metrics={"tokens_per_second": 45.0},
+        )
+    ]
+
+    summary = build_report_summary(plan={"model_name": "llama3.2"}, environment={}, runs=runs)
+    markdown = render_markdown_report(summary)
+
+    assert summary.session_metrics["available_system_memory_mb_median"] == 768.0
+    assert summary.session_metrics["system_cpu_load_snapshot_median"] == 87.5
+    assert "One or more runs started with advisory host pressure warnings." in summary.warnings
+    assert "Host pressure reasons observed: available_system_memory_mb < 1024; system_cpu_load_snapshot >= 80%" in summary.warnings
+    assert "- available_system_memory_mb: median 768.0 | p95 768.0 | n=1" not in markdown
+    assert "- system_cpu_load_snapshot: median 87.5 | p95 87.5 | n=1" not in markdown
+
+
+def test_report_summary_surfaces_concurrency_smoke_metrics() -> None:
+    runs = [
+        RunResult(
+            run_id="run-concurrency-smoke",
+            run_index=1,
+            model_name="llama3.2",
+            context_size=4096,
+            context_index=1,
+            benchmark_type=BenchmarkType.CONCURRENCY_SMOKE,
+            benchmark_type_index=1,
+            scenario_id="concurrency-smoke-p2-v1",
+            scenario_index=1,
+            state=RunState.COMPLETED,
+            elapsed_ms=160.0,
+            metrics={
+                "concurrency_parallelism": 2,
+                "concurrency_request_elapsed_ms_p50": 125.0,
+                "concurrency_request_elapsed_ms_p95": 150.0,
+                "concurrency_request_ttft_ms_p50": 20.0,
+                "concurrency_request_ttft_ms_p95": 25.0,
+            },
+        )
+    ]
+
+    summary = build_report_summary(plan={"model_name": "llama3.2"}, environment={}, runs=runs)
+    markdown = render_markdown_report(summary)
+
+    assert summary.session_metrics["concurrency_request_elapsed_ms_p50_median"] == 125.0
+    assert summary.session_metrics["concurrency_request_elapsed_ms_p95_median"] == 150.0
+    assert summary.session_metrics["concurrency_request_ttft_ms_p50_median"] == 20.0
+    assert summary.session_metrics["concurrency_request_ttft_ms_p95_median"] == 25.0
+    assert "- concurrency_request_elapsed_ms_p50: median 125.0 | p95 125.0 | n=1" not in markdown
 
 
 def test_write_session_artifacts_keep_prep_and_calibration_contract_consistent_across_outputs(
@@ -463,6 +650,14 @@ def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates
                 "eligible_for_ttft_aggregate": True,
                 "load_duration_ms": 5.0,
                 "ttft_ms": 100.0,
+                "stream_emission_count": 3,
+                "stream_duration_ms": 80.0,
+                "stream_emission_interval_ms_median": 30.0,
+                "stream_emission_interval_ms_p95": 50.0,
+                "stream_output_units_per_second": 37.5,
+                "peak_gpu_memory_mb": 3072.0,
+                "avg_gpu_util_percent": 45.0,
+                "peak_gpu_util_percent": 70.0,
                 "prompt_tokens_per_second": 1000.0,
                 "generation_tokens_per_second": 10.0,
                 "tokens_per_second": 10.0,
@@ -485,6 +680,14 @@ def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates
                 "eligible_for_ttft_aggregate": True,
                 "load_duration_ms": 7.0,
                 "ttft_ms": 200.0,
+                "stream_emission_count": 1,
+                "stream_duration_ms": 0.0,
+                "stream_emission_interval_ms_median": None,
+                "stream_emission_interval_ms_p95": None,
+                "stream_output_units_per_second": None,
+                "peak_gpu_memory_mb": 4096.0,
+                "avg_gpu_util_percent": 55.0,
+                "peak_gpu_util_percent": 80.0,
                 "prompt_tokens_per_second": 2000.0,
                 "generation_tokens_per_second": 20.0,
                 "tokens_per_second": 20.0,
@@ -507,6 +710,11 @@ def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates
                 "eligible_for_ttft_aggregate": False,
                 "load_duration_ms": 50.0,
                 "ttft_ms": 5000.0,
+                "stream_emission_count": 8,
+                "stream_duration_ms": 300.0,
+                "stream_emission_interval_ms_median": 40.0,
+                "stream_emission_interval_ms_p95": 70.0,
+                "stream_output_units_per_second": 26.667,
                 "prompt_tokens_per_second": 9000.0,
                 "generation_tokens_per_second": 90.0,
                 "tokens_per_second": 90.0,
@@ -553,11 +761,36 @@ def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates
     assert summary.session_metrics["load_duration_ms_sample_size"] == 3
     assert summary.session_metrics["load_duration_ms_median"] == 7.0
     assert summary.session_metrics["load_duration_ms_p95"] == 50.0
+    assert summary.session_metrics["stream_emission_count_sample_size"] == 3
+    assert summary.session_metrics["stream_emission_count_median"] == 3.0
+    assert summary.session_metrics["stream_emission_count_p95"] == 8.0
+    assert summary.session_metrics["stream_duration_ms_sample_size"] == 3
+    assert summary.session_metrics["stream_duration_ms_median"] == 80.0
+    assert summary.session_metrics["stream_duration_ms_p95"] == 300.0
+    assert summary.session_metrics["stream_emission_interval_ms_median_sample_size"] == 2
+    assert summary.session_metrics["stream_emission_interval_ms_median_median"] == 35.0
+    assert summary.session_metrics["stream_emission_interval_ms_median_p95"] == 40.0
+    assert summary.session_metrics["stream_emission_interval_ms_p95_sample_size"] == 2
+    assert summary.session_metrics["stream_emission_interval_ms_p95_median"] == 60.0
+    assert summary.session_metrics["stream_emission_interval_ms_p95_p95"] == 70.0
+    assert summary.session_metrics["stream_output_units_per_second_sample_size"] == 2
+    assert summary.session_metrics["stream_output_units_per_second_median"] == 32.084
+    assert summary.session_metrics["stream_output_units_per_second_p95"] == 37.5
+    assert summary.session_metrics["peak_gpu_memory_mb_sample_size"] == 2
+    assert summary.session_metrics["peak_gpu_memory_mb_median"] == 3584.0
+    assert summary.session_metrics["peak_gpu_memory_mb_p95"] == 4096.0
+    assert summary.session_metrics["avg_gpu_util_percent_sample_size"] == 2
+    assert summary.session_metrics["avg_gpu_util_percent_median"] == 50.0
+    assert summary.session_metrics["avg_gpu_util_percent_p95"] == 55.0
+    assert summary.session_metrics["peak_gpu_util_percent_sample_size"] == 2
+    assert summary.session_metrics["peak_gpu_util_percent_median"] == 75.0
+    assert summary.session_metrics["peak_gpu_util_percent_p95"] == 80.0
 
     model_summary = summary.model_summaries["llama3.2"]
     assert model_summary.metrics["completed_sample_size"] == 3
     assert model_summary.metrics["generation_tokens_per_second_median"] == 20.0
     assert model_summary.metrics["generation_tokens_per_second_p95"] == 90.0
+    assert model_summary.metrics["stream_duration_ms_median"] == 80.0
 
     benchmark_summary = summary.benchmark_summaries[0]
     assert benchmark_summary["sample_size"] == 4
@@ -574,6 +807,14 @@ def test_build_report_summary_uses_completed_and_eligible_samples_for_aggregates
     assert benchmark_summary["generation_tokens_per_second_p95"] == 20.0
     assert benchmark_summary["load_duration_ms_median"] == 6.0
     assert benchmark_summary["load_duration_ms_p95"] == 7.0
+    assert benchmark_summary["stream_emission_count_median"] == 2.0
+    assert benchmark_summary["stream_duration_ms_median"] == 40.0
+    assert benchmark_summary["stream_emission_interval_ms_median_median"] == 30.0
+    assert benchmark_summary["stream_emission_interval_ms_p95_median"] == 50.0
+    assert benchmark_summary["stream_output_units_per_second_median"] == 37.5
+    assert benchmark_summary["peak_gpu_memory_mb_median"] == 3584.0
+    assert benchmark_summary["avg_gpu_util_percent_median"] == 50.0
+    assert benchmark_summary["peak_gpu_util_percent_median"] == 75.0
 
 
 def test_build_report_summary_excludes_failed_prep_and_failed_calibration_from_strict_aggregates() -> None:
@@ -715,6 +956,14 @@ def test_render_markdown_report_surfaces_completed_sample_stats_without_alias_le
                     "eligible_for_ttft_aggregate": True,
                     "load_duration_ms": 5.0,
                     "ttft_ms": 100.0,
+                    "stream_emission_count": 3,
+                    "stream_duration_ms": 80.0,
+                    "stream_emission_interval_ms_median": 30.0,
+                    "stream_emission_interval_ms_p95": 50.0,
+                    "stream_output_units_per_second": 37.5,
+                    "peak_gpu_memory_mb": 3072.0,
+                    "avg_gpu_util_percent": 45.0,
+                    "peak_gpu_util_percent": 70.0,
                     "prompt_tokens_per_second": 1000.0,
                     "generation_tokens_per_second": 10.0,
                     "tokens_per_second": 10.0,
@@ -737,6 +986,14 @@ def test_render_markdown_report_surfaces_completed_sample_stats_without_alias_le
                     "eligible_for_ttft_aggregate": True,
                     "load_duration_ms": 7.0,
                     "ttft_ms": 200.0,
+                    "stream_emission_count": 5,
+                    "stream_duration_ms": 120.0,
+                    "stream_emission_interval_ms_median": 25.0,
+                    "stream_emission_interval_ms_p95": 35.0,
+                    "stream_output_units_per_second": 41.667,
+                    "peak_gpu_memory_mb": 4096.0,
+                    "avg_gpu_util_percent": 55.0,
+                    "peak_gpu_util_percent": 80.0,
                     "prompt_tokens_per_second": 2000.0,
                     "generation_tokens_per_second": 20.0,
                     "tokens_per_second": 20.0,
@@ -747,14 +1004,112 @@ def test_render_markdown_report_surfaces_completed_sample_stats_without_alias_le
 
     markdown = render_markdown_report(summary)
 
-    assert "Completed samples: 2 of 2 runs" in markdown
-    assert "elapsed_ms: median 15.0 | p95 20.0 | n=2" in markdown
-    assert "ttft_ms: median 150.0 | p95 200.0 | n=2" in markdown
-    assert "prompt_tokens_per_second: median 1500.0 | p95 2000.0 | n=2" in markdown
-    assert "generation_tokens_per_second: median 15.0 | p95 20.0 | n=2" in markdown
-    assert "load_duration_ms: median 6.0 | p95 7.0 | n=2" in markdown
+    assert "2 of 2 runs completed successfully for llama3.2." in markdown
+    assert "By benchmark family:" in markdown
+    assert "- Smoke: elapsed median 15.0; prompt tokens/s median 1500.0; generation tokens/s median 15.0." in markdown
+    assert "Completed samples: 2 of 2 runs" not in markdown
+    assert "Run elapsed time: median 15.0 | p95 20.0 | n=2" in markdown
+    assert "TTFT: median 150.0 | p95 200.0 | n=2" in markdown
+    assert "Prompt tokens/s: median 1500.0 | p95 2000.0 | n=2" in markdown
+    assert "Generation tokens/s: median 15.0 | p95 20.0 | n=2" in markdown
+    assert "Load duration: median 6.0 | p95 7.0 | n=2" in markdown
+    assert "stream_emission_interval_ms_median: median 27.5 | p95 30.0 | n=2" not in markdown
+    assert "Median stream emission interval: median 27.5 | p95 30.0 | n=2" not in markdown
+    assert "Peak GPU memory: median 3584.0 | p95 4096.0 | n=2" not in markdown
     assert "\n- tokens_per_second:" not in markdown
     assert "| tokens_per_second |" not in markdown
+
+
+def test_render_markdown_report_summarizes_benchmark_families_separately() -> None:
+    summary = build_report_summary(
+        plan={"model_name": "llama3.2"},
+        environment={},
+        runs=[
+            RunResult(
+                run_id="run-smoke",
+                run_index=1,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type=BenchmarkType.SMOKE,
+                benchmark_type_index=1,
+                scenario_id="smoke-basic-v1",
+                scenario_index=1,
+                state=RunState.COMPLETED,
+                elapsed_ms=10.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "prompt_tokens_per_second": 1000.0,
+                    "generation_tokens_per_second": 20.0,
+                },
+            ),
+            RunResult(
+                run_id="run-ttft",
+                run_index=2,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type=BenchmarkType.TTFT,
+                benchmark_type_index=2,
+                scenario_id="ttft-short-v1",
+                scenario_index=1,
+                state=RunState.COMPLETED,
+                elapsed_ms=30.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "eligible_for_ttft_aggregate": True,
+                    "ttft_ms": 80.0,
+                },
+            ),
+            RunResult(
+                run_id="run-concurrency-p2",
+                run_index=3,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type=BenchmarkType.CONCURRENCY_SMOKE,
+                benchmark_type_index=3,
+                scenario_id="concurrency-smoke-p2-v1",
+                scenario_index=1,
+                state=RunState.COMPLETED,
+                elapsed_ms=160.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "concurrency_parallelism": 2,
+                    "concurrency_request_ttft_ms_p50": 20.0,
+                },
+            ),
+            RunResult(
+                run_id="run-concurrency-p4",
+                run_index=4,
+                model_name="llama3.2",
+                context_size=4096,
+                context_index=1,
+                benchmark_type=BenchmarkType.CONCURRENCY_SMOKE,
+                benchmark_type_index=3,
+                scenario_id="concurrency-smoke-p4-v1",
+                scenario_index=2,
+                state=RunState.COMPLETED,
+                elapsed_ms=260.0,
+                metrics={
+                    "eligible_for_strict_aggregate": True,
+                    "concurrency_parallelism": 4,
+                    "concurrency_request_ttft_ms_p50": 35.0,
+                },
+            ),
+        ],
+    )
+
+    markdown = render_markdown_report(summary)
+    executive_section = markdown.split("## Per-model summary", maxsplit=1)[0]
+
+    assert "4 of 4 runs completed successfully for llama3.2." in executive_section
+    assert "By benchmark family:" in executive_section
+    assert "- Smoke: elapsed median 10.0; prompt tokens/s median 1000.0; generation tokens/s median 20.0." in executive_section
+    assert "- TTFT: TTFT median 80.0; elapsed median 30.0." in executive_section
+    assert "- Concurrency-smoke: p=2 elapsed median 160.0; p=4 elapsed median 260.0; request TTFT p50 median 27.5." in executive_section
+    assert "- Run elapsed time: median 95.0" not in executive_section
+    assert "- TTFT: median 80.0" not in executive_section
 
 
 def test_render_markdown_report_uses_only_the_required_section_contract() -> None:

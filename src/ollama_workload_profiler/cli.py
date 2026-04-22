@@ -23,6 +23,7 @@ from .reporting.compare import (
     render_compare_json,
     render_compare_text,
 )
+from .reporting.plots import PlotExportError, export_summary_plots
 from .session import (
     build_profile_session_plan,
     expand_session_plan,
@@ -256,6 +257,30 @@ def compare(
         for reason in result.strict_failure_reasons:
             typer.echo(f"- {reason}")
         raise typer.Exit(code=1)
+
+
+@app.command("export-plots")
+def export_plots(
+    session_dir: Annotated[
+        Path,
+        typer.Argument(help="Completed benchmark session directory containing summary.json."),
+    ],
+    output_dir: Annotated[
+        Path | None,
+        typer.Option("--output-dir", help="Directory for generated SVG plot artifacts."),
+    ] = None,
+) -> None:
+    """Export blog-friendly SVG charts from a completed session summary."""
+    try:
+        written = export_summary_plots(session_dir, output_dir=output_dir)
+    except PlotExportError as exc:
+        typer.echo(f"Plot export failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    target_dir = written[0].parent if written else (output_dir or session_dir / "plots")
+    typer.echo(f"Plot artifacts written to: {target_dir}")
+    for path in written:
+        typer.echo(f"- {path.name}")
 
 
 @app.command()

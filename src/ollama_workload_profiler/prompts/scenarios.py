@@ -41,6 +41,7 @@ class ScenarioDefinition:
     fill_ratio: float | None = None
     difficulty_tag: str | None = None
     phase_emphasis: str | None = None
+    parallelism: int | None = None
 
 
 def build_scenarios_for_benchmark(

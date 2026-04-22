@@ -118,6 +118,37 @@ def test_compare_help_is_available() -> None:
     assert "--all-metrics" in result.stdout
 
 
+def test_export_plots_command_writes_default_plot_directory(tmp_path: Path) -> None:
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    _write_compare_json(
+        session_dir / "summary.json",
+        {
+            "benchmark_summaries": [
+                {
+                    "model_name": "llama3.2",
+                    "context_size": 4096,
+                    "benchmark_type": "prompt-scaling",
+                    "scenario_id": "prompt-scaling-small-v1",
+                    "strict_sample_size": 1,
+                    "prompt_eval_count_median": 1024.0,
+                    "ttft_ms_median": 80.0,
+                    "prompt_tokens_per_second_median": 2100.0,
+                    "generation_tokens_per_second_median": 52.0,
+                }
+            ]
+        },
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["export-plots", str(session_dir)])
+
+    assert result.exit_code == 0
+    assert "Plot artifacts written to:" in result.stdout
+    assert (session_dir / "plots" / "latency_vs_prompt_size.svg").exists()
+    assert (session_dir / "plots" / "throughput_vs_prompt_size.svg").exists()
+
+
 def test_compare_strict_returns_nonzero_for_strict_blocking_warnings(tmp_path: Path) -> None:
     baseline = tmp_path / "baseline"
     candidate = tmp_path / "candidate"
@@ -325,12 +356,13 @@ def test_parse_benchmark_types_preserves_order_and_deduplicates() -> None:
 
 
 def test_parse_benchmark_types_accepts_all_supported_benchmark_families() -> None:
-    assert parse_benchmark_types("smoke, cold-warm, output-scaling, ttft, stress") == [
+    assert parse_benchmark_types("smoke, cold-warm, output-scaling, ttft, stress, concurrency-smoke") == [
         BenchmarkType.SMOKE,
         BenchmarkType.COLD_WARM,
         BenchmarkType.OUTPUT_SCALING,
         BenchmarkType.TTFT,
         BenchmarkType.STRESS,
+        BenchmarkType.CONCURRENCY_SMOKE,
     ]
 
 

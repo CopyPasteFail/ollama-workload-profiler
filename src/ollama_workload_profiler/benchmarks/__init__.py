@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import (
     cold_warm,
+    concurrency,
     context_scaling,
     output_scaling,
     profiles,
@@ -24,6 +25,7 @@ from ..prompts.scenarios import ScenarioDefinition
 _FAMILIES = {
     BenchmarkType.SMOKE: smoke.family(),
     BenchmarkType.COLD_WARM: cold_warm.family(),
+    BenchmarkType.CONCURRENCY_SMOKE: concurrency.family(),
     BenchmarkType.PROMPT_SCALING: prompt_scaling.family(),
     BenchmarkType.CONTEXT_SCALING: context_scaling.family(),
     BenchmarkType.OUTPUT_SCALING: output_scaling.family(),

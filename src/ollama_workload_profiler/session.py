@@ -5,12 +5,15 @@ import platform
 import shutil
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from itertools import cycle
+from math import ceil
 from pathlib import Path
+from statistics import median
 from time import perf_counter
 from typing import Any
 
@@ -156,14 +159,14 @@ class TerminalProgressReporter(ProgressReporter):
         self._echo(
             self._render_live_line(
                 _format_live_status_line(
-                current_run,
-                total_runs=total_runs,
-                elapsed_seconds=elapsed_seconds,
-                telemetry=telemetry,
-                spinner=next(self._live_spinner),
-                completed_runs=completed_runs,
-                failed_runs=failed_runs + stopped_runs,
-            )
+                    current_run,
+                    total_runs=total_runs,
+                    elapsed_seconds=elapsed_seconds,
+                    telemetry=telemetry,
+                    spinner=next(self._live_spinner),
+                    completed_runs=completed_runs,
+                    failed_runs=failed_runs + stopped_runs,
+                )
             ),
             nl=False,
         )
@@ -191,6 +194,7 @@ BENCHMARK_EXECUTION_ORDER: tuple[BenchmarkType, ...] = (
     BenchmarkType.OUTPUT_SCALING,
     BenchmarkType.USE_CASE_PROFILES,
     BenchmarkType.TTFT,
+    BenchmarkType.CONCURRENCY_SMOKE,
     BenchmarkType.STRESS,
 )
 
@@ -575,9 +579,11 @@ class _OllamaDispatcher:
         client: OllamaClient,
         *,
         calibration_cache: dict[tuple[str, int, str, str], dict[str, Any]] | None = None,
+        concurrency_client_factory: Any | None = None,
     ) -> None:
         self._client = client
         self._calibration_cache = calibration_cache if calibration_cache is not None else {}
+        self._concurrency_client_factory = concurrency_client_factory if concurrency_client_factory is not None else OllamaClient
 
     def _build_options(self, request: ExecutionRequest) -> dict[str, Any]:
         return _build_execution_options(
@@ -600,6 +606,14 @@ class _OllamaDispatcher:
             elapsed_ms = _response_elapsed_ms(response, started_at, finished_at=finished_at)
             metrics = _response_metrics(response)
             metrics.update(stream_metrics)
+            return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
+
+        if request.execution_mode is ExecutionMode.CONCURRENCY:
+            metrics, finished_at = self._execute_concurrency_smoke(
+                request=request,
+                prompt_payload=prompt_payload,
+            )
+            elapsed_ms = round((finished_at - started_at) * 1000, 3)
             return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
 
         options = _build_execution_options(
@@ -650,6 +664,87 @@ class _OllamaDispatcher:
                 metrics["actual_prompt_tokens"] = int(prompt_eval_count)
         return ExecutionResult(elapsed_ms=elapsed_ms, metrics=metrics)
 
+    def _execute_concurrency_smoke(
+        self,
+        *,
+        request: ExecutionRequest,
+        prompt_payload: Any,
+    ) -> tuple[dict[str, Any], float]:
+        if not isinstance(prompt_payload, TextPromptPayload):
+            raise TypeError(f"Unsupported concurrency prompt payload: {type(prompt_payload)!r}")
+
+        parallelism = request.scenario.parallelism
+        if parallelism not in {2, 4}:
+            raise ValueError("concurrency smoke supports parallelism values 2 and 4")
+
+        start_barrier = threading.Barrier(parallelism)
+
+        def execute_one(request_index: int) -> dict[str, Any]:
+            start_barrier.wait()
+            return self._execute_concurrency_stream_request(
+                request=request,
+                prompt=prompt_payload.text,
+                request_index=request_index,
+            )
+
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            request_results = list(executor.map(execute_one, range(1, parallelism + 1)))
+
+        metrics: dict[str, Any] = {
+            "concurrency_mode": "same_machine_threaded_streams",
+            "concurrency_parallelism": parallelism,
+            "concurrency_request_count": len(request_results),
+            "concurrency_requests": sorted(request_results, key=lambda item: item["request_index"]),
+        }
+        metrics.update(_build_concurrency_aggregate_metrics(request_results))
+        return metrics, perf_counter()
+
+    def _execute_concurrency_stream_request(
+        self,
+        *,
+        request: ExecutionRequest,
+        prompt: str,
+        request_index: int,
+    ) -> dict[str, Any]:
+        started_at = perf_counter()
+        first_token_at: float | None = None
+        emission_offsets_ms: list[float] = []
+        last_chunk: dict[str, Any] = {}
+        worker_client = self._concurrency_client_factory()
+        try:
+            stream_resource = worker_client.stream_generate(
+                model=request.run.model_name,
+                prompt=prompt,
+                options=self._build_options(request),
+            )
+            stream_context = stream_resource if hasattr(stream_resource, "__enter__") else nullcontext(stream_resource)
+            with stream_context as stream:
+                for chunk in stream:
+                    last_chunk = dict(chunk)
+                    if _stream_chunk_has_text(chunk):
+                        emitted_at = perf_counter()
+                        emission_offsets_ms.append(round((emitted_at - started_at) * 1000, 3))
+                        if first_token_at is None:
+                            first_token_at = emitted_at
+        finally:
+            close = getattr(worker_client, "close", None)
+            if callable(close):
+                close()
+
+        finished_at = perf_counter()
+        elapsed_ms = _response_elapsed_ms(last_chunk, started_at, finished_at=finished_at)
+        result: dict[str, Any] = {
+            "request_index": request_index,
+            "elapsed_ms": elapsed_ms,
+            "ttft_ms": round((first_token_at - started_at) * 1000, 3) if first_token_at is not None else None,
+            "ttft_first_token_received": first_token_at is not None,
+            **_build_stream_shape_metrics(emission_offsets_ms),
+        }
+        response_metrics = _response_metrics(last_chunk)
+        if response_metrics:
+            result["response_metrics"] = response_metrics
+        return result
+
     def _execute_ttft_stream(
         self,
         *,
@@ -673,20 +768,25 @@ class _OllamaDispatcher:
                 )
 
         first_token_at: float | None = None
+        emission_offsets_ms: list[float] = []
         last_chunk: dict[str, Any] = {}
         stream_resource = stream_factory()
         stream_context = stream_resource if hasattr(stream_resource, "__enter__") else nullcontext(stream_resource)
         with stream_context as stream:
             for chunk in stream:
                 last_chunk = dict(chunk)
-                if first_token_at is None and _stream_chunk_has_text(chunk):
-                    first_token_at = perf_counter()
+                if _stream_chunk_has_text(chunk):
+                    emitted_at = perf_counter()
+                    emission_offsets_ms.append(round((emitted_at - started_at) * 1000, 3))
+                    if first_token_at is None:
+                        first_token_at = emitted_at
 
         finished_at = perf_counter()
         metrics: dict[str, Any] = {
             "ttft_measurement_started_at": round(started_at, 6),
             "ttft_first_token_received": first_token_at is not None,
             "ttft_first_token_at": round(first_token_at, 6) if first_token_at is not None else None,
+            **_build_stream_shape_metrics(emission_offsets_ms),
         }
         if first_token_at is not None:
             metrics["ttft_ms"] = round((first_token_at - started_at) * 1000, 3)
@@ -948,6 +1048,75 @@ def _response_metrics(response: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
+def _build_stream_shape_metrics(emission_offsets_ms: list[float]) -> dict[str, Any]:
+    emission_count = len(emission_offsets_ms)
+    stream_duration_ms = (
+        round(emission_offsets_ms[-1] - emission_offsets_ms[0], 3)
+        if emission_count > 0
+        else None
+    )
+    intervals_ms = [
+        round(emission_offsets_ms[index] - emission_offsets_ms[index - 1], 3)
+        for index in range(1, emission_count)
+    ]
+
+    return {
+        "stream_emission_count": emission_count,
+        "stream_emission_offsets_ms": list(emission_offsets_ms),
+        "stream_duration_ms": stream_duration_ms,
+        "stream_emission_interval_ms_median": _median_or_none(intervals_ms),
+        "stream_emission_interval_ms_p95": _p95_or_none(intervals_ms),
+        "stream_output_units_per_second": _stream_output_units_per_second(
+            emission_count=emission_count,
+            stream_duration_ms=stream_duration_ms,
+        ),
+        "stream_output_unit": "emission",
+    }
+
+
+def _stream_output_units_per_second(
+    *,
+    emission_count: int,
+    stream_duration_ms: float | None,
+) -> float | None:
+    if emission_count < 2 or not isinstance(stream_duration_ms, (int, float)) or stream_duration_ms <= 0:
+        return None
+    return round(float(emission_count) / (float(stream_duration_ms) / 1000.0), 3)
+
+
+def _build_concurrency_aggregate_metrics(request_results: list[Mapping[str, Any]]) -> dict[str, Any]:
+    elapsed_values = _numeric_values([result.get("elapsed_ms") for result in request_results])
+    ttft_values = _numeric_values([result.get("ttft_ms") for result in request_results])
+    return {
+        "concurrency_request_elapsed_ms_p50": _median_or_none(elapsed_values),
+        "concurrency_request_elapsed_ms_p95": _p95_or_none(elapsed_values),
+        "concurrency_request_ttft_ms_p50": _median_or_none(ttft_values),
+        "concurrency_request_ttft_ms_p95": _p95_or_none(ttft_values),
+    }
+
+
+def _numeric_values(values: Iterable[Any]) -> list[float]:
+    return [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return round(float(median(values)), 3)
+
+
+def _p95_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    rank = max(1, ceil(len(ordered) * 0.95))
+    return round(ordered[rank - 1], 3)
+
+
 def _stream_chunk_has_text(chunk: Mapping[str, Any]) -> bool:
     # TTFT counts the first streamed model output, including "thinking" chunks,
     # because they are still the earliest token-bearing emission from the model.
@@ -1046,11 +1215,23 @@ def _build_host_metadata() -> dict[str, Any]:
 
 def _build_run_system_snapshot() -> dict[str, Any]:
     virtual_memory = _safe_virtual_memory()
+    cpu_percent = _safe_cpu_percent()
+    available_memory_mb = _bytes_to_mb(getattr(virtual_memory, "available", None))
+    memory_used_percent = _safe_number(getattr(virtual_memory, "percent", None))
+    warning_reasons = _host_pressure_warning_reasons(
+        system_cpu_load_snapshot=cpu_percent,
+        available_system_memory_mb=available_memory_mb,
+        memory_used_percent=memory_used_percent,
+    )
     return {
-        "cpu_percent": _safe_cpu_percent(),
-        "memory_available_mb": _bytes_to_mb(getattr(virtual_memory, "available", None)),
-        "memory_used_percent": _safe_number(getattr(virtual_memory, "percent", None)),
-        "ollama_process_count": len(find_ollama_processes()),
+        "cpu_percent": cpu_percent,
+        "system_cpu_load_snapshot": cpu_percent,
+        "memory_available_mb": available_memory_mb,
+        "available_system_memory_mb": available_memory_mb,
+        "memory_used_percent": memory_used_percent,
+        "host_pressure_warning": bool(warning_reasons),
+        "host_pressure_warning_reasons": warning_reasons,
+        "ollama_process_count": _safe_ollama_process_count(),
     }
 
 
@@ -1189,6 +1370,13 @@ def _safe_cpu_percent() -> float | None:
         return None
 
 
+def _safe_ollama_process_count() -> int | None:
+    try:
+        return len(find_ollama_processes())
+    except Exception:
+        return None
+
+
 def _bytes_to_mb(value: Any) -> float | None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
@@ -1199,6 +1387,22 @@ def _safe_number(value: Any) -> float | None:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
     return round(float(value), 3)
+
+
+def _host_pressure_warning_reasons(
+    *,
+    system_cpu_load_snapshot: float | None,
+    available_system_memory_mb: float | None,
+    memory_used_percent: float | None,
+) -> list[str]:
+    reasons: list[str] = []
+    if isinstance(system_cpu_load_snapshot, (int, float)) and system_cpu_load_snapshot >= 80:
+        reasons.append("system_cpu_load_snapshot >= 80%")
+    if isinstance(memory_used_percent, (int, float)) and memory_used_percent >= 90:
+        reasons.append("memory_used_percent >= 90%")
+    if isinstance(available_system_memory_mb, (int, float)) and available_system_memory_mb < 1024:
+        reasons.append("available_system_memory_mb < 1024")
+    return reasons
 
 
 def _safe_string(factory: Any) -> str | None:

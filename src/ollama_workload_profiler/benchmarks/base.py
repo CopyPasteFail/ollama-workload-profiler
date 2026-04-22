@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Protocol
 
-from ..metrics.phases import compute_phase_peaks
+from ..metrics.phases import compute_gpu_telemetry_summary, compute_phase_peaks, compute_process_telemetry_summary
 from ..metrics.sampler import SamplePoint
 from ..models.failures import FailureInfo
 from ..models.plan import BenchmarkType, PlannedRun
@@ -17,6 +17,7 @@ from ..prompts.scenarios import ScenarioDefinition
 class ExecutionMode(StrEnum):
     GENERATE = "generate"
     TTFT = "ttft"
+    CONCURRENCY = "concurrency"
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,8 @@ class BenchmarkRunner:
                 }
                 for phase, peak in compute_phase_peaks(samples).items()
             }
+            finalized_metrics.update(compute_process_telemetry_summary(samples))
+            finalized_metrics.update(compute_gpu_telemetry_summary(samples))
 
         failure: FailureInfo | None = None
         partial_result = False
