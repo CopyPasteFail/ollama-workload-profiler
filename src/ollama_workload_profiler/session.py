@@ -109,7 +109,7 @@ class TerminalProgressReporter(ProgressReporter):
             self._current_total_runs = total_runs
 
         if self._live:
-            self._echo(self._finalize_live_line(_format_run_result_row(run_result, total_runs=total_runs)))
+            self._echo(self._finalize_live_line(_format_run_result_row_live(run_result, total_runs=total_runs)))
         return None
 
     def on_session_finished(self, summary: ReportSummary, *, total_runs: int) -> None:
@@ -1305,6 +1305,20 @@ def _format_run_result_row(run_result: RunResult, *, total_runs: int) -> str:
     )
 
 
+def _format_run_result_row_live(run_result: RunResult, *, total_runs: int) -> str:
+    return (
+        "Result"
+        f" | run {run_result.run_index}/{total_runs}"
+        f" | {run_result.state.value}"
+        f" | {run_result.benchmark_type.value}"
+        f" | {run_result.scenario_name or run_result.scenario_id}"
+        f" | ctx {run_result.context_size}"
+        f" | rep {run_result.repetition_index}"
+        f" | elapsed {_format_elapsed_seconds_live(run_result.elapsed_ms / 1000.0)}"
+        f" | tok/s {_format_stat(run_result.metrics.get('tokens_per_second'))}"
+    )
+
+
 def _render_progress_bar(completed_runs: int, total_runs: int, *, width: int = 10) -> str:
     if total_runs <= 0:
         return "[----------]"
@@ -1323,7 +1337,16 @@ def _format_stat(value: Any, *, suffix: str = "") -> str:
 def _format_elapsed_seconds_live(value: float | None) -> str:
     if not isinstance(value, (int, float)):
         return "--"
-    return f"{int(round(float(value)))}s"
+
+    total_seconds = max(0, int(round(float(value))))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    if minutes > 0:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
 
 
 def _format_elapsed_seconds_result(value_ms: float | None) -> str:

@@ -47,6 +47,7 @@ from ollama_workload_profiler.session import (
     _OllamaDispatcher,
     _build_concurrency_aggregate_metrics,
     _build_run_system_snapshot,
+    _format_run_result_row,
     _response_metrics,
     _requested_repetitions,
     build_profile_session_plan,
@@ -1012,7 +1013,7 @@ def test_run_profile_session_notifies_progress_reporter_for_each_run(
 
 def test_terminal_progress_reporter_emits_default_and_live_progress_lines() -> None:
     outputs: list[tuple[str, bool]] = []
-    clock_values = iter([100.0, 101.25])
+    clock_values = iter([100.0, 169.0])
     planned_run = PlannedRun(
         run_id="run-progress",
         run_index=7,
@@ -1041,7 +1042,7 @@ def test_terminal_progress_reporter_emits_default_and_live_progress_lines() -> N
         repetition_index=planned_run.repetition_index,
         scenario_name=planned_run.scenario_name,
         state=RunState.COMPLETED,
-        elapsed_ms=1250.0,
+        elapsed_ms=69000.0,
         metrics={"tokens_per_second": 42.5},
     )
 
@@ -1063,15 +1064,54 @@ def test_terminal_progress_reporter_emits_default_and_live_progress_lines() -> N
     assert any("High fill context" in line for line in lines)
     assert any("ctx 32768" in line for line in lines)
     assert any("rep 2" in line for line in lines)
-    assert any("elapsed 1s" in line for line in lines)
+    assert any("elapsed 1m 9s" in line for line in lines)
     assert any("CPU 73.5%" in line and "RSS 2048.0 MB" in line for line in lines)
     assert any("completed 0 | pending 42 | failed 0" in line for line in lines)
     assert any(
         "Result | run 7/42 | completed | context-scaling | High fill context" in line
-        and "elapsed 1.2s" in line
+        and "elapsed 1m 9s" in line
         and "tok/s 42.5" in line
         for line in lines
     )
+
+
+def test_run_result_row_keeps_seconds_format_for_report_output() -> None:
+    planned_run = PlannedRun(
+        run_id="run-report",
+        run_index=3,
+        model_name="gemma4:latest",
+        context_size=32768,
+        context_index=1,
+        benchmark_type=BenchmarkType.CONTEXT_SCALING,
+        benchmark_type_index=1,
+        scenario_id="context-scaling-high-v1",
+        scenario_index=3,
+        repetition_index=1,
+        scenario_name="High fill context",
+        scenario_version="v1",
+    )
+    run_result = RunResult(
+        run_id=planned_run.run_id,
+        run_index=planned_run.run_index,
+        model_name=planned_run.model_name,
+        context_size=planned_run.context_size,
+        context_index=planned_run.context_index,
+        benchmark_type=planned_run.benchmark_type,
+        benchmark_type_index=planned_run.benchmark_type_index,
+        scenario_id=planned_run.scenario_id,
+        scenario_index=planned_run.scenario_index,
+        scenario_version=planned_run.scenario_version,
+        repetition_index=planned_run.repetition_index,
+        scenario_name=planned_run.scenario_name,
+        state=RunState.COMPLETED,
+        elapsed_ms=69000.0,
+        metrics={"tokens_per_second": 42.5},
+    )
+
+    row = _format_run_result_row(run_result, total_runs=42)
+
+    assert "elapsed 69.0s" in row
+    assert "elapsed 1m 9s" not in row
 
 
 def test_terminal_progress_reporter_redraws_live_status_in_place() -> None:
