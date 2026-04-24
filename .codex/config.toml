@@ -1,7 +1,6 @@
 # BEGIN codex-context-profiler managed
 # profiler_recommended_profile = "backend-light"
 # This block contains explicit repo-local Codex config.
-# It is not a Codex profile selector.
 
 [mcp_servers.playwright]
 enabled = false
