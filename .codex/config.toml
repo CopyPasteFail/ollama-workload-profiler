@@ -1,5 +1,8 @@
 # BEGIN codex-context-profiler managed
-# profiler_recommended_profile = "backend-light"
+# policy_name = "repo-safe"
+# policy_posture = "conservative"
+# repo_shape = "backend-light"
+# inventory_scope = "snapshot"
 # This block contains explicit repo-local Codex config.
 
 [mcp_servers.playwright]
